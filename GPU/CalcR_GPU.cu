@@ -36,6 +36,11 @@
 #include <unordered_set>
 #include <string>
 #include <vector>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <queue>
+#include <atomic>
 #include <hiredis/hiredis.h>
 
 // ===========================================================================
@@ -557,6 +562,41 @@ static std::string hex256(const uint64_t v[4]) {
 }
 
 // ===========================================================================
+// Thread-Safe Task Queue for Pipelining
+// ===========================================================================
+struct BatchTask {
+    int stream_idx;
+    uint64_t k_start[4];
+    uint64_t* r_ptr;
+    int n;
+};
+
+template <typename T>
+class SafeQueue {
+private:
+    std::queue<T> q;
+    std::mutex m;
+    std::condition_variable cv;
+public:
+    void push(T val) {
+        std::lock_guard<std::mutex> lock(m);
+        q.push(val);
+        cv.notify_one();
+    }
+    T pop() {
+        std::unique_lock<std::mutex> lock(m);
+        cv.wait(lock, [this]{ return !q.empty(); });
+        T val = q.front();
+        q.pop();
+        return val;
+    }
+    size_t size() {
+        std::lock_guard<std::mutex> lock(m);
+        return q.size();
+    }
+};
+
+// ===========================================================================
 // Redis Scanner Logic
 // ===========================================================================
 class RedisScanner {
@@ -572,7 +612,6 @@ public:
             else printf("Redis Connection Error: Can't allocate redis context\n");
             exit(1);
         }
-        printf("Connected to Redis: %s:%d\n", ip, port);
         
         redisReply *reply = (redisReply *)redisCommand(ctx, "SELECT 0");
         freeReplyObject(reply);
@@ -583,52 +622,66 @@ public:
         if (tag_buffer) delete[] tag_buffer;
     }
 
-    void checkMatchBatch(const uint64_t *ks_ptr, const uint64_t *rs_ptr, int n) {
+    void checkMatchBatch(const uint64_t k_start[4], const uint64_t *rs_ptr, int n) {
         if (n <= 0) return;
 
-        if (n > current_n) {
-            if (tag_buffer) delete[] tag_buffer;
-            tag_buffer = new char[n * 13];
-            current_n = n;
-        }
-
-        std::vector<const char*> argv;
-        std::vector<size_t> argvlen;
-
-        argv.push_back("SMISMEMBER");
-        argvlen.push_back(10);
-        argv.push_back("mongo_keys");
-        argvlen.push_back(10);
-
-        for (int i = 0; i < n; i++) {
-            to_hex48(tag_buffer + i * 13, rs_ptr[i * 4]);
-            argv.push_back(tag_buffer + i * 13);
-            argvlen.push_back(12);
-        }
-
-        redisReply *reply = (redisReply *)redisCommandArgv(ctx, argv.size(), argv.data(), argvlen.data());
+        const int sub_batch_size = 50000; // 增加到 5 萬增加 Redis 吞吐量
         
-        if (reply == nullptr) {
-            fprintf(stderr, "Redis error: %s\n", ctx->errstr);
-            return;
+        if (sub_batch_size > current_n) {
+            if (tag_buffer) delete[] tag_buffer;
+            tag_buffer = new char[sub_batch_size * 13];
+            current_n = sub_batch_size;
         }
 
-        if (reply->type == REDIS_REPLY_ARRAY) {
-            for (size_t j = 0; j < reply->elements; j++) {
-                if (reply->element[j]->integer == 1) {
-                    std::string ks = hex256(ks_ptr + j * 4);
-                    std::string rs = hex256(rs_ptr + j * 4);
-                    std::string val = "{" + ks + ":" + rs + "}";
-                    
-                    printf("\n[MATCH FOUND!] k = %s\n", ks.c_str());
-                    printf("               r = %s\n", rs.c_str());
+        for (int start = 0; start < n; start += sub_batch_size) {
+            int current_batch = (n - start < sub_batch_size) ? (n - start) : sub_batch_size;
 
-                    redisReply *set_reply = (redisReply *)redisCommand(ctx, "SET match:%s %s", ks.c_str(), val.c_str());
-                    freeReplyObject(set_reply);
+            std::vector<const char*> argv;
+            std::vector<size_t> argvlen;
+
+            argv.push_back("SMISMEMBER");
+            argvlen.push_back(10);
+            argv.push_back("mongo_keys");
+            argvlen.push_back(10);
+
+            for (int i = 0; i < current_batch; i++) {
+                to_hex48(tag_buffer + i * 13, rs_ptr[(start + i) * 4]);
+                argv.push_back(tag_buffer + i * 13);
+                argvlen.push_back(12);
+            }
+
+            redisReply *reply = (redisReply *)redisCommandArgv(ctx, argv.size(), argv.data(), argvlen.data());
+            
+            if (reply == nullptr) {
+                fprintf(stderr, "Redis error: %s\n", ctx->errstr);
+                continue;
+            }
+
+            if (reply->type == REDIS_REPLY_ARRAY) {
+                for (size_t j = 0; j < reply->elements; j++) {
+                    if (reply->element[j]->integer == 1) {
+                        // 命中！還原 k 值
+                        uint64_t k_match[4];
+                        uint64_t carry = (uint64_t)(start + j);
+                        for (int limb = 0; limb < 4; limb++) {
+                            k_match[limb] = k_start[limb] + carry;
+                            carry = (k_match[limb] < k_start[limb]) ? 1 : 0;
+                        }
+
+                        std::string ks = hex256(k_match);
+                        std::string rs = hex256(rs_ptr + (start + j) * 4);
+                        std::string val = "{" + ks + ":" + rs + "}";
+                        
+                        printf("\n[MATCH FOUND!] k = %s\n", ks.c_str());
+                        printf("               r = %s\n", rs.c_str());
+
+                        redisReply *set_reply = (redisReply *)redisCommand(ctx, "SET match:%s %s", ks.c_str(), val.c_str());
+                        freeReplyObject(set_reply);
+                    }
                 }
             }
+            freeReplyObject(reply);
         }
-        freeReplyObject(reply);
     }
 };
 
@@ -673,13 +726,13 @@ static void checkCuda(cudaError_t err, const char *msg) {
 }
 
 int main(int argc, char **argv) {
-    int n = 2097152; 
+    int n = 1048576; 
     bool infinite = false;
 
     if (argc > 1) {
         n = atoi(argv[1]);
         if (n == 0) {
-            n = 2097152;
+            n = 1048576;
             infinite = true;
         }
     }
@@ -689,7 +742,7 @@ int main(int argc, char **argv) {
     if (argc > 2) parse256(k_start, argv[2]);
     if (k_start[0] == 0 && k_start[1] == 0 && k_start[2] == 0 && k_start[3] == 0) k_start[0] = 1;
 
-    printf("=== CalcR_GPU: secp256k1 r = x(k*G) mod n (Extreme Optimized) ===\n");
+    printf("=== CalcR_GPU: secp256k1 r = x(k*G) mod n (Multi-threaded Extreme) ===\n");
     printf("批次大小: %d\n", n);
     printHex256("起始 k", k_start);
     
@@ -699,9 +752,9 @@ int main(int argc, char **argv) {
     checkCuda(cudaMemcpyToSymbol(DEV_GY, HOST_GY, 32), "cpyGy");
 
     // -----------------------------------------------------------------------
-    // 分配 Pinned Memory 與 CUDA Streams
+    // 分配 Ring Buffer 與 CUDA Streams (增加到 32 個以對抗 Redis 延遲)
     // -----------------------------------------------------------------------
-    const int num_streams = 2;
+    const int num_streams = 32;
     cudaStream_t streams[num_streams];
     uint64_t *d_X[num_streams], *d_Y[num_streams], *d_Z[num_streams], *d_r[num_streams];
     uint64_t *h_r[num_streams], *h_k[num_streams];
@@ -719,47 +772,74 @@ int main(int argc, char **argv) {
         checkCuda(cudaHostAlloc(&h_k[i], X_bytes, cudaHostAllocPortable), "hostAlloc k");
     }
 
+    // -----------------------------------------------------------------------
+    // 多執行緒 Redis Worker 池 (增加到 16 個 Worker)
+    // -----------------------------------------------------------------------
+    const int num_workers = 16;
+    SafeQueue<BatchTask> task_queue;
+    SafeQueue<int> free_indices;
+    for (int i = 0; i < num_streams; i++) free_indices.push(i);
+
+    std::vector<std::thread> workers;
+    for (int i = 0; i < num_workers; i++) {
+        workers.emplace_back([&task_queue, &free_indices, streams]() {
+            RedisScanner scanner("host.docker.internal", 6379);
+            while (true) {
+                BatchTask task = task_queue.pop();
+                if (task.n == -1) break; // Sentinel to exit
+                
+                checkCuda(cudaStreamSynchronize(streams[task.stream_idx]), "sync in worker");
+                
+                scanner.checkMatchBatch(task.k_start, task.r_ptr, task.n);
+                free_indices.push(task.stream_idx);
+            }
+        });
+    }
+
     int threads = 256;
     int blocks  = (n + threads - 1) / threads;
 
-    RedisScanner scanner("host.docker.internal", 6379);
+    printf("Starting Producer loop (GPU) with %d Workers...\n", num_workers);
 
-    cudaEvent_t start_event, stop_event;
-    cudaEventCreate(&start_event);
-    cudaEventCreate(&stop_event);
-
-    int current_stream = 0;
-    bool first_iter = true;
+    std::atomic<long long> total_keys(0);
+    auto start_time = std::chrono::high_resolution_clock::now();
 
     do {
-        cudaEventRecord(start_event, streams[current_stream]);
+        // 從空閒索引隊列取出一個 Buffer
+        int idx = free_indices.pop();
 
-        // 1. 計算 k 值列表 (CPU)
-        for (int i = 0; i < n; i++) {
-            uint64_t carry = (uint64_t)i;
-            for (int j = 0; j < 4; j++) {
-                h_k[current_stream][i * 4 + j] = k_start[j] + carry;
-                carry = (h_k[current_stream][i * 4 + j] < k_start[j]) ? 1 : 0;
-            }
-        }
-
-        // 2. 啟動 GPU 運算
-        ComputeKG_Jacobian<<<blocks, threads, 0, streams[current_stream]>>> (
+        // 2. 啟動 GPU 運算 (直接傳入 k_start，不需要在 CPU 算 1M 次)
+        ComputeKG_Jacobian<<<blocks, threads, 0, streams[idx]>>> (
             k_start[0], k_start[1], k_start[2], k_start[3], 
-            d_X[current_stream], d_Y[current_stream], d_Z[current_stream], n
+            d_X[idx], d_Y[idx], d_Z[idx], n
         );
-        ParallelConvertToR<<<blocks, threads, 0, streams[current_stream]>>> (
-            d_X[current_stream], d_Z[current_stream], d_r[current_stream], n
+        ParallelConvertToR<<<blocks, threads, 0, streams[idx]>>> (
+            d_X[idx], d_Z[idx], d_r[idx], n
         );
         
         // 3. 非同步拷貝回 Host
-        checkCuda(cudaMemcpyAsync(h_r[current_stream], d_r[current_stream], X_bytes, cudaMemcpyDeviceToHost, streams[current_stream]), "async cpy");
+        checkCuda(cudaMemcpyAsync(h_r[idx], d_r[idx], X_bytes, cudaMemcpyDeviceToHost, streams[idx]), "async cpy");
 
-        // 4. 等待前一個 Stream 完成並進行 Redis 比對 (Pipelining)
-        if (!first_iter) {
-            int prev_stream = (current_stream + 1) % num_streams;
-            checkCuda(cudaStreamSynchronize(streams[prev_stream]), "sync prev");
-            scanner.checkMatchBatch(h_k[prev_stream], h_r[prev_stream], n);
+        // 4. 立即丟進 Task Queue
+        BatchTask task;
+        task.stream_idx = idx;
+        memcpy(task.k_start, k_start, 32);
+        task.r_ptr = h_r[idx];
+        task.n = n;
+        task_queue.push(task);
+
+        total_keys += n;
+        static auto last_print = start_time;
+        auto current_time = std::chrono::high_resolution_clock::now();
+        std::chrono::duration<double> total_elapsed = current_time - start_time;
+        std::chrono::duration<double> print_elapsed = current_time - last_print;
+
+        if (print_elapsed.count() > 2.0) {
+            double speed = total_keys / total_elapsed.count();
+            printf("\r[PRODUCER] Speed: %.2f keys/sec | Total: %lld | FreeBuff: %d", 
+                   speed, (long long)total_keys, (int)num_streams - (int)task_queue.size()); // Approx check
+            fflush(stdout);
+            last_print = current_time;
         }
 
         // 遞增 k_start
@@ -770,23 +850,15 @@ int main(int argc, char **argv) {
             carry = (k_start[j] < val) ? 1 : 0;
         }
 
-        current_stream = (current_stream + 1) % num_streams;
-        first_iter = false;
-
-        cudaEventRecord(stop_event, streams[current_stream]);
-        float ms = 0;
-        cudaEventElapsedTime(&ms, start_event, stop_event);
-        if (ms > 0) {
-            double speed = (double)n / (ms / 1000.0);
-            printf("\rEst. Speed: %.2f keys/sec", speed);
-            fflush(stdout);
-        }
-
     } while (infinite);
 
-    // 最後一波處理
-    checkCuda(cudaStreamSynchronize(streams[(current_stream + 1) % num_streams]), "final sync");
-    scanner.checkMatchBatch(h_k[(current_stream + 1) % num_streams], h_r[(current_stream + 1) % num_streams], n);
+    // Shutdown workers
+    for (int i = 0; i < num_workers; i++) {
+        BatchTask sentinel;
+        sentinel.n = -1;
+        task_queue.push(sentinel);
+    }
+    for (auto &t : workers) t.join();
 
     return 0;
 }
