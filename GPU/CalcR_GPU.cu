@@ -319,34 +319,139 @@ __global__ void ParallelConvertToR(
     uint64_t *rs,          // [n * 4]  output r values
     int       n)
 {
+    __shared__ uint64_t sh_prefixes[256 * 4]; 
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= n) return;
+    int ltid = threadIdx.x;
 
-    uint64_t *Xi = Xs + tid * 4;
-    uint64_t *Zi = Zs + tid * 5;
-    uint64_t *ri = rs + tid * 4;
+    uint64_t z[4] = {1, 0, 0, 0};
+    bool valid = tid < n;
 
-    // 若 Z=0，表示無窮遠點 (k=0)，r=0
-    if (Zi[0]==0 && Zi[1]==0 && Zi[2]==0 && Zi[3]==0) {
-        ri[0]=ri[1]=ri[2]=ri[3]=0;
+    if (valid) {
+        z[0] = Zs[tid * 5 + 0];
+        z[1] = Zs[tid * 5 + 1];
+        z[2] = Zs[tid * 5 + 2];
+        z[3] = Zs[tid * 5 + 3];
+        // 處理 Z=0 的情況 (無窮遠點)
+        if (z[0] == 0 && z[1] == 0 && z[2] == 0 && z[3] == 0) {
+            z[0] = 1; // 暫時設為 1 以免 Batch Inverse 出錯，最後再改回 r=0
+        }
+    }
+
+    // Step 1: 前綴乘積
+    sh_prefixes[ltid * 4 + 0] = z[0];
+    sh_prefixes[ltid * 4 + 1] = z[1];
+    sh_prefixes[ltid * 4 + 2] = z[2];
+    sh_prefixes[ltid * 4 + 3] = z[3];
+
+    for (int stride = 1; stride < blockDim.x; stride *= 2) {
+        __syncthreads();
+        uint64_t tmp[4];
+        if (ltid >= stride) {
+            uint64_t a[4], b[4];
+            a[0] = sh_prefixes[ltid * 4 + 0]; a[1] = sh_prefixes[ltid * 4 + 1];
+            a[2] = sh_prefixes[ltid * 4 + 2]; a[3] = sh_prefixes[ltid * 4 + 3];
+            b[0] = sh_prefixes[(ltid - stride) * 4 + 0]; b[1] = sh_prefixes[(ltid - stride) * 4 + 1];
+            b[2] = sh_prefixes[(ltid - stride) * 4 + 2]; b[3] = sh_prefixes[(ltid - stride) * 4 + 3];
+            ModMulP(tmp, a, b);
+        }
+        __syncthreads();
+        if (ltid >= stride) {
+            sh_prefixes[ltid * 4 + 0] = tmp[0]; sh_prefixes[ltid * 4 + 1] = tmp[1];
+            sh_prefixes[ltid * 4 + 2] = tmp[2]; sh_prefixes[ltid * 4 + 3] = tmp[3];
+        }
+    }
+
+    // Step 2: 單個 ModInv
+    __shared__ uint64_t sh_inv_all[5];
+    if (ltid == blockDim.x - 1) {
+        sh_inv_all[0] = sh_prefixes[ltid * 4 + 0];
+        sh_inv_all[1] = sh_prefixes[ltid * 4 + 1];
+        sh_inv_all[2] = sh_prefixes[ltid * 4 + 2];
+        sh_inv_all[3] = sh_prefixes[ltid * 4 + 3];
+        sh_inv_all[4] = 0;
+        _ModInv(sh_inv_all);
+    }
+    __syncthreads();
+
+    if (!valid) return;
+
+    // Step 3: 計算個別 invZ
+    if (ltid == 0) {
+        // 第一個線程的 invZ 就已經是 inv_Pn * S_1 (因為 P_0 = z_0) ? No.
+    } 
+    
+    // ... (rest of the logic remains same, just removing the unused block above)
+    
+    // 考慮到 BlockDim 只有 256，最有效率的是「後向前綴乘積」
+    __shared__ uint64_t sh_suffixes[256 * 4];
+    sh_suffixes[ltid * 4 + 0] = z[0];
+    sh_suffixes[ltid * 4 + 1] = z[1];
+    sh_suffixes[ltid * 4 + 2] = z[2];
+    sh_suffixes[ltid * 4 + 3] = z[3];
+
+    for (int stride = 1; stride < blockDim.x; stride *= 2) {
+        __syncthreads();
+        uint64_t tmp[4];
+        if (ltid + stride < blockDim.x) {
+            uint64_t a[4], b[4];
+            a[0] = sh_suffixes[ltid * 4 + 0]; a[1] = sh_suffixes[ltid * 4 + 1];
+            a[2] = sh_suffixes[ltid * 4 + 2]; a[3] = sh_suffixes[ltid * 4 + 3];
+            b[0] = sh_suffixes[(ltid + stride) * 4 + 0]; b[1] = sh_suffixes[(ltid + stride) * 4 + 1];
+            b[2] = sh_suffixes[(ltid + stride) * 4 + 2]; b[3] = sh_suffixes[(ltid + stride) * 4 + 3];
+            ModMulP(tmp, a, b);
+        }
+        __syncthreads();
+        if (ltid + stride < blockDim.x) {
+            sh_suffixes[ltid * 4 + 0] = tmp[0]; sh_suffixes[ltid * 4 + 1] = tmp[1];
+            sh_suffixes[ltid * 4 + 2] = tmp[2]; sh_suffixes[ltid * 4 + 3] = tmp[3];
+        }
+    }
+    __syncthreads();
+
+    // 現在：
+    // sh_prefixes[i] = z_0 * ... * z_i
+    // sh_suffixes[i] = z_i * ... * z_{n-1}
+    // inv_Zi = inv_Pn * (z_0 * ... * z_{i-1}) * (z_{i+1} * ... * z_{n-1})
+    
+    uint64_t final_inv[4];
+    uint64_t base_inv[4] = {sh_inv_all[0], sh_inv_all[1], sh_inv_all[2], sh_inv_all[3]};
+    
+    uint64_t part[4] = {1, 0, 0, 0};
+    if (ltid > 0) {
+        part[0] = sh_prefixes[(ltid - 1) * 4 + 0];
+        part[1] = sh_prefixes[(ltid - 1) * 4 + 1];
+        part[2] = sh_prefixes[(ltid - 1) * 4 + 2];
+        part[3] = sh_prefixes[(ltid - 1) * 4 + 3];
+    }
+    ModMulP(final_inv, base_inv, part);
+    
+    if (ltid < blockDim.x - 1) {
+        uint64_t suff[4];
+        suff[0] = sh_suffixes[(ltid + 1) * 4 + 0];
+        suff[1] = sh_suffixes[(ltid + 1) * 4 + 1];
+        suff[2] = sh_suffixes[(ltid + 1) * 4 + 2];
+        suff[3] = sh_suffixes[(ltid + 1) * 4 + 3];
+        ModMulP(final_inv, final_inv, suff);
+    }
+    
+    // final_inv 現在就是 z_i^{-1} mod P
+    
+    // 檢查原本是否為無窮遠點
+    if (Zs[tid*5+0]==0 && Zs[tid*5+1]==0 && Zs[tid*5+2]==0 && Zs[tid*5+3]==0) {
+        rs[tid*4+0] = rs[tid*4+1] = rs[tid*4+2] = rs[tid*4+3] = 0;
         return;
     }
 
-    // invZ = Z^{-1} mod P
-    uint64_t invZ[5] = {Zi[0], Zi[1], Zi[2], Zi[3], 0};
-    _ModInv(invZ);
-
-    // invZ2 = Z^{-2} mod P
     uint64_t invZ2[5];
-    _ModMult(invZ2, invZ, invZ);
+    uint64_t invZ5[5] = {final_inv[0], final_inv[1], final_inv[2], final_inv[3], 0};
+    _ModMult(invZ2, invZ5, invZ5);
     invZ2[4] = 0;
 
-    // x_affine = X * Z^{-2} mod P
+    uint64_t Xi[4] = {Xs[tid*4+0], Xs[tid*4+1], Xs[tid*4+2], Xs[tid*4+3]};
     uint64_t X5[5] = {Xi[0], Xi[1], Xi[2], Xi[3], 0};
     uint64_t Xa5[5];
     _ModMult(Xa5, X5, invZ2);
 
-    // r = x_affine mod n
     uint64_t xa[4] = {Xa5[0], Xa5[1], Xa5[2], Xa5[3]};
     uint64_t local_N[4] = {0xBFD25E8CD0364141ULL, 0xBAAEDCE6AF48A03BULL, 0xFFFFFFFFFFFFFFFEULL, 0xFFFFFFFFFFFFFFFFULL};
     
@@ -355,6 +460,7 @@ __global__ void ParallelConvertToR(
              (xa[3]==local_N[3] && xa[2]==local_N[2] && xa[1]>local_N[1]) ||
              (xa[3]==local_N[3] && xa[2]==local_N[2] && xa[1]==local_N[1] && xa[0]>=local_N[0]);
     
+    uint64_t *ri = rs + tid * 4;
     if (ge) {
         ModSub256(ri, xa, local_N);
     } else {
@@ -419,19 +525,34 @@ static void printHex256(const char *label, const uint64_t v[4]) {
            (unsigned long long)v[1], (unsigned long long)v[0]);
 }
 
-static std::string hex256(const uint64_t v[4]) {
-    char buf[65];
-    snprintf(buf, sizeof(buf), "%016llx%016llx%016llx%016llx",
-             (unsigned long long)v[3], (unsigned long long)v[2],
-             (unsigned long long)v[1], (unsigned long long)v[0]);
-    return std::string(buf);
+// ===========================================================================
+// Fast Hex Conversion
+// ===========================================================================
+static const char HEX_CHARS[] = "0123456789abcdef";
+
+static void to_hex256(char *dest, const uint64_t v[4]) {
+    for (int i = 0; i < 4; i++) {
+        uint64_t val = v[3 - i];
+        for (int j = 15; j >= 0; j--) {
+            dest[i * 16 + j] = HEX_CHARS[val & 0xf];
+            val >>= 4;
+        }
+    }
+    dest[64] = '\0';
 }
 
-// 提取最後 12 位十六進位字元 (48 bits)
-static std::string hex12(const uint64_t v[4]) {
-    char buf[13];
-    // 最後 12 位對應 v[0] 的低 48 位
-    snprintf(buf, sizeof(buf), "%012llx", (unsigned long long)(v[0] & 0xFFFFFFFFFFFFULL));
+static void to_hex48(char *dest, uint64_t v0) {
+    uint64_t val = v0 & 0xFFFFFFFFFFFFULL;
+    for (int j = 11; j >= 0; j--) {
+        dest[j] = HEX_CHARS[val & 0xf];
+        val >>= 4;
+    }
+    dest[12] = '\0';
+}
+
+static std::string hex256(const uint64_t v[4]) {
+    char buf[65];
+    to_hex256(buf, v);
     return std::string(buf);
 }
 
@@ -441,6 +562,8 @@ static std::string hex12(const uint64_t v[4]) {
 class RedisScanner {
 public:
     redisContext *ctx = nullptr;
+    char* tag_buffer = nullptr;
+    int current_n = 0;
 
     RedisScanner(const char *ip, int port) {
         ctx = redisConnect(ip, port);
@@ -451,20 +574,24 @@ public:
         }
         printf("Connected to Redis: %s:%d\n", ip, port);
         
-        // Select DB 0
         redisReply *reply = (redisReply *)redisCommand(ctx, "SELECT 0");
         freeReplyObject(reply);
     }
 
     ~RedisScanner() {
         if (ctx) redisFree(ctx);
+        if (tag_buffer) delete[] tag_buffer;
     }
 
     void checkMatchBatch(const uint64_t *ks_ptr, const uint64_t *rs_ptr, int n) {
         if (n <= 0) return;
 
-        // 建立 SMISMEMBER 命令
-        // 格式: SMISMEMBER mongo_keys tag1 tag2 ... tagN
+        if (n > current_n) {
+            if (tag_buffer) delete[] tag_buffer;
+            tag_buffer = new char[n * 13];
+            current_n = n;
+        }
+
         std::vector<const char*> argv;
         std::vector<size_t> argvlen;
 
@@ -473,13 +600,9 @@ public:
         argv.push_back("mongo_keys");
         argvlen.push_back(10);
 
-        // 為了 SMISMEMBER，我們只需要最後 12 位字串
-        std::vector<std::string> tag_strings;
-        tag_strings.reserve(n);
-
         for (int i = 0; i < n; i++) {
-            tag_strings.push_back(hex12(rs_ptr + i * 4));
-            argv.push_back(tag_strings.back().c_str());
+            to_hex48(tag_buffer + i * 13, rs_ptr[i * 4]);
+            argv.push_back(tag_buffer + i * 13);
             argvlen.push_back(12);
         }
 
@@ -493,9 +616,8 @@ public:
         if (reply->type == REDIS_REPLY_ARRAY) {
             for (size_t j = 0; j < reply->elements; j++) {
                 if (reply->element[j]->integer == 1) {
-                    // 命中！
                     std::string ks = hex256(ks_ptr + j * 4);
-                    std::string rs = hex256(rs_ptr + j * 4); // 紀錄全長的 r
+                    std::string rs = hex256(rs_ptr + j * 4);
                     std::string val = "{" + ks + ":" + rs + "}";
                     
                     printf("\n[MATCH FOUND!] k = %s\n", ks.c_str());
@@ -510,12 +632,10 @@ public:
     }
 };
 
-// 解析 256-bit 字串 (支援 0x 十六進位或十進位)
 static void parse256(uint64_t r[4], const char *s) {
     memset(r, 0, 32);
     if (!s) return;
     if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
-        // Hex
         s += 2;
         int len = strlen(s);
         for (int i = 0; i < len; i++) {
@@ -524,7 +644,6 @@ static void parse256(uint64_t r[4], const char *s) {
             else if (s[i] >= 'a' && s[i] <= 'f') val = s[i] - 'a' + 10;
             else if (s[i] >= 'A' && s[i] <= 'F') val = s[i] - 'A' + 10;
             else break;
-            // r = r * 16 + val
             uint64_t carry = val;
             for (int j = 0; j < 4; j++) {
                 uint64_t next_carry = r[j] >> 60;
@@ -533,11 +652,9 @@ static void parse256(uint64_t r[4], const char *s) {
             }
         }
     } else {
-        // Decimal
         for (int i = 0; s[i] != '\0'; i++) {
             if (s[i] < '0' || s[i] > '9') break;
             int digit = s[i] - '0';
-            // r = r * 10 + digit
             uint64_t carry = digit;
             for (int j = 0; j < 4; j++) {
                 __uint128_t prod = (__uint128_t)r[j] * 10 + carry;
@@ -555,14 +672,8 @@ static void checkCuda(cudaError_t err, const char *msg) {
     }
 }
 
-// ===========================================================================
-// main
-// ===========================================================================
-// ===========================================================================
-// main
-// ===========================================================================
 int main(int argc, char **argv) {
-    int n = 2097152; // 預設計算 2M 個 k 值 (RTX 3060 12G 資源更佳)
+    int n = 2097152; 
     bool infinite = false;
 
     if (argc > 1) {
@@ -574,109 +685,108 @@ int main(int argc, char **argv) {
     }
     if (n <= 0) n = 1048576;
 
-    // 起始 k 值（預設 1）
     uint64_t k_start[4] = {1, 0, 0, 0};
     if (argc > 2) parse256(k_start, argv[2]);
-    
-    if (k_start[0] == 0 && k_start[1] == 0 && k_start[2] == 0 && k_start[3] == 0) {
-        k_start[0] = 1;
-    }
+    if (k_start[0] == 0 && k_start[1] == 0 && k_start[2] == 0 && k_start[3] == 0) k_start[0] = 1;
 
-    printf("=== CalcR_GPU: secp256k1  r = x(k*G) mod n (RTX 3060 Optimized) ===\n");
+    printf("=== CalcR_GPU: secp256k1 r = x(k*G) mod n (Extreme Optimized) ===\n");
     printf("批次大小: %d\n", n);
     printHex256("起始 k", k_start);
-    if (infinite) printf("模式: 無盡循環 (Ctrl+C 停止)\n\n");
-    else printf("模式: 單次計算\n\n");
-
-    // -----------------------------------------------------------------------
-    // 上傳常數到 GPU
-    // -----------------------------------------------------------------------
+    
     checkCuda(cudaMemcpyToSymbol(DEV_P,  HOST_P,  32), "cpyP");
     checkCuda(cudaMemcpyToSymbol(DEV_N,  HOST_N,  32), "cpyN");
     checkCuda(cudaMemcpyToSymbol(DEV_GX, HOST_GX, 32), "cpyGx");
     checkCuda(cudaMemcpyToSymbol(DEV_GY, HOST_GY, 32), "cpyGy");
 
     // -----------------------------------------------------------------------
-    // 分配 GPU 記憶體
+    // 分配 Pinned Memory 與 CUDA Streams
     // -----------------------------------------------------------------------
-    uint64_t *d_X, *d_Y, *d_Z, *d_r;
+    const int num_streams = 2;
+    cudaStream_t streams[num_streams];
+    uint64_t *d_X[num_streams], *d_Y[num_streams], *d_Z[num_streams], *d_r[num_streams];
+    uint64_t *h_r[num_streams], *h_k[num_streams];
+
     size_t X_bytes = (size_t)n * 4 * sizeof(uint64_t);
     size_t Z_bytes = (size_t)n * 5 * sizeof(uint64_t);
 
-    checkCuda(cudaMalloc(&d_X, X_bytes), "malloc X");
-    checkCuda(cudaMalloc(&d_Y, X_bytes), "malloc Y");
-    checkCuda(cudaMalloc(&d_Z, Z_bytes), "malloc Z");
-    checkCuda(cudaMalloc(&d_r, X_bytes), "malloc r");
-
-    uint64_t *h_r = (uint64_t *)malloc(X_bytes);
+    for (int i = 0; i < num_streams; i++) {
+        checkCuda(cudaStreamCreate(&streams[i]), "stream create");
+        checkCuda(cudaMalloc(&d_X[i], X_bytes), "malloc X");
+        checkCuda(cudaMalloc(&d_Y[i], X_bytes), "malloc Y");
+        checkCuda(cudaMalloc(&d_Z[i], Z_bytes), "malloc Z");
+        checkCuda(cudaMalloc(&d_r[i], X_bytes), "malloc r");
+        checkCuda(cudaHostAlloc(&h_r[i], X_bytes, cudaHostAllocPortable), "hostAlloc r");
+        checkCuda(cudaHostAlloc(&h_k[i], X_bytes, cudaHostAllocPortable), "hostAlloc k");
+    }
 
     int threads = 256;
     int blocks  = (n + threads - 1) / threads;
 
     RedisScanner scanner("host.docker.internal", 6379);
 
-    cudaEvent_t t_start, t_stop;
-    cudaEventCreate(&t_start);
-    cudaEventCreate(&t_stop);
+    cudaEvent_t start_event, stop_event;
+    cudaEventCreate(&start_event);
+    cudaEventCreate(&stop_event);
+
+    int current_stream = 0;
+    bool first_iter = true;
 
     do {
-        cudaEventRecord(t_start);
+        cudaEventRecord(start_event, streams[current_stream]);
 
-        // -----------------------------------------------------------------------
-        // 執行運算
-        // -----------------------------------------------------------------------
-        ComputeKG_Jacobian<<<blocks, threads>>>(k_start[0], k_start[1], k_start[2], k_start[3], d_X, d_Y, d_Z, n);
-        ParallelConvertToR<<<blocks, threads>>>(d_X, d_Z, d_r, n);
-        
-        cudaEventRecord(t_stop);
-        checkCuda(cudaEventSynchronize(t_stop), "sync");
-
-        float ms = 0;
-        cudaEventElapsedTime(&ms, t_start, t_stop);
-
-        // -----------------------------------------------------------------------
-        // 比對 Redis (使用 SMISMEMBER 批次查詢)
-        // -----------------------------------------------------------------------
-        checkCuda(cudaMemcpy(h_r, d_r, X_bytes, cudaMemcpyDeviceToHost), "cpy r all");
-
-        // 預先計算本批次的所有 k 值
-        std::vector<uint64_t> h_k(n * 4);
+        // 1. 計算 k 值列表 (CPU)
         for (int i = 0; i < n; i++) {
             uint64_t carry = (uint64_t)i;
             for (int j = 0; j < 4; j++) {
-                h_k[i * 4 + j] = k_start[j] + carry;
-                carry = (h_k[i * 4 + j] < k_start[j]) ? 1 : 0;
+                h_k[current_stream][i * 4 + j] = k_start[j] + carry;
+                carry = (h_k[current_stream][i * 4 + j] < k_start[j]) ? 1 : 0;
             }
         }
 
-        scanner.checkMatchBatch(h_k.data(), h_r, n);
+        // 2. 啟動 GPU 運算
+        ComputeKG_Jacobian<<<blocks, threads, 0, streams[current_stream]>>> (
+            k_start[0], k_start[1], k_start[2], k_start[3], 
+            d_X[current_stream], d_Y[current_stream], d_Z[current_stream], n
+        );
+        ParallelConvertToR<<<blocks, threads, 0, streams[current_stream]>>> (
+            d_X[current_stream], d_Z[current_stream], d_r[current_stream], n
+        );
+        
+        // 3. 非同步拷貝回 Host
+        checkCuda(cudaMemcpyAsync(h_r[current_stream], d_r[current_stream], X_bytes, cudaMemcpyDeviceToHost, streams[current_stream]), "async cpy");
 
-        double speed = (double)n / (ms / 1000.0);
-
-        // 列印批次摘要
-        uint64_t k_last[4];
-        uint64_t carry = (uint64_t)(n - 1);
-        for (int j = 0; j < 4; j++) {
-            k_last[j] = k_start[j] + carry;
-            carry = (k_last[j] < k_start[j]) ? 1 : 0;
+        // 4. 等待前一個 Stream 完成並進行 Redis 比對 (Pipelining)
+        if (!first_iter) {
+            int prev_stream = (current_stream + 1) % num_streams;
+            checkCuda(cudaStreamSynchronize(streams[prev_stream]), "sync prev");
+            scanner.checkMatchBatch(h_k[prev_stream], h_r[prev_stream], n);
         }
 
-        printf("-----------------------------------------------------------------------\n");
-        printf("Speed: %.2f keys/sec (Batch Time: %.2f ms)\n", speed, ms);
-        printHex256("Batch First k", k_start);
-        printHex256("            r", h_r);
-        printHex256("Batch Last  k", k_last);
-        printHex256("            r", h_r + (n-1)*4);
-        printf("\n");
-
         // 遞增 k_start
-        carry = (uint64_t)n;
+        uint64_t carry = (uint64_t)n;
         for (int j = 0; j < 4; j++) {
             uint64_t val = k_start[j];
             k_start[j] = val + carry;
             carry = (k_start[j] < val) ? 1 : 0;
         }
+
+        current_stream = (current_stream + 1) % num_streams;
+        first_iter = false;
+
+        cudaEventRecord(stop_event, streams[current_stream]);
+        float ms = 0;
+        cudaEventElapsedTime(&ms, start_event, stop_event);
+        if (ms > 0) {
+            double speed = (double)n / (ms / 1000.0);
+            printf("\rEst. Speed: %.2f keys/sec", speed);
+            fflush(stdout);
+        }
+
     } while (infinite);
+
+    // 最後一波處理
+    checkCuda(cudaStreamSynchronize(streams[(current_stream + 1) % num_streams]), "final sync");
+    scanner.checkMatchBatch(h_k[(current_stream + 1) % num_streams], h_r[(current_stream + 1) % num_streams], n);
 
     return 0;
 }
