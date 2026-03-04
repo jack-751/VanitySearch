@@ -306,69 +306,55 @@ __device__ void ScalarMultG_Jacobian(
 //   one ModInv:    inv = prefix[n-1]^{-1}
 //   backward pass: inv_Zi = inv * prefix[i-1]; inv = inv * Z[i]
 // ===========================================================================
-__global__ void BatchConvertToR(
+// ===========================================================================
+// 並行轉換 Kernel：每個 thread 獨立執行求逆以最大化 Warp 調度效率
+// ===========================================================================
+__global__ void ParallelConvertToR(
     uint64_t *Xs,          // [n * 4]  Jacobian X
     uint64_t *Zs,          // [n * 5]  Jacobian Z (5 limbs)
     uint64_t *rs,          // [n * 4]  output r values
     int       n)
 {
-    // 這個 kernel 是單 thread 執行的小工具（批次轉換）
-    // 因為 n 通常不大（幾千至幾萬），一個 warp 就夠
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid != 0) return;
+    if (tid >= n) return;
 
-    // prefix products
-    // 為節省記憶體，就地計算（此 kernel 只有 1 thread）
-    // prefix[i] = Z[0]*Z[1]*...*Z[i]  (5-limb)
-    // 我們在 Zs 上作前向累積，但不要破壞原始 Zs。
-    // 這裡使用動態分配（適合 kernel 內小陣列）不好，
-    // 改用逐個求逆（效率低但簡單）。
-    // 注意：此 kernel 只處理 n 個結果，n 通常 <= 65536。
-    // 若 n 太大，應分批呼叫。
+    uint64_t *Xi = Xs + tid * 4;
+    uint64_t *Zi = Zs + tid * 5;
+    uint64_t *ri = rs + tid * 4;
 
-    for (int i = 0; i < n; i++) {
-        uint64_t *Xi = Xs + i * 4;
-        uint64_t *Zi = Zs + i * 5;
-        uint64_t *ri = rs + i * 4;
+    // 若 Z=0，表示無窮遠點 (k=0)，r=0
+    if (Zi[0]==0 && Zi[1]==0 && Zi[2]==0 && Zi[3]==0) {
+        ri[0]=ri[1]=ri[2]=ri[3]=0;
+        return;
+    }
 
-        // 若 Z=0，表示無窮遠點（k=0），r=0
-        if (Zi[0]==0 && Zi[1]==0 && Zi[2]==0 && Zi[3]==0) {
-            ri[0]=ri[1]=ri[2]=ri[3]=0;
-            continue;
-        }
+    // invZ = Z^{-1} mod P
+    uint64_t invZ[5] = {Zi[0], Zi[1], Zi[2], Zi[3], 0};
+    _ModInv(invZ);
 
-        // invZ = Z^{-1} mod P
-        uint64_t invZ[5];
-        invZ[0]=Zi[0]; invZ[1]=Zi[1]; invZ[2]=Zi[2]; invZ[3]=Zi[3]; invZ[4]=0;
-        _ModInv(invZ); // invZ = Z^{-1}
+    // invZ2 = Z^{-2} mod P
+    uint64_t invZ2[5];
+    _ModMult(invZ2, invZ, invZ);
+    invZ2[4] = 0;
 
-        // invZ2 = Z^{-2} mod P
-        uint64_t invZ2[4];
-        uint64_t tmp_a[5], tmp_b[5];
-        tmp_a[0]=invZ[0]; tmp_a[1]=invZ[1]; tmp_a[2]=invZ[2]; tmp_a[3]=invZ[3]; tmp_a[4]=0;
-        tmp_b[0]=invZ[0]; tmp_b[1]=invZ[1]; tmp_b[2]=invZ[2]; tmp_b[3]=invZ[3]; tmp_b[4]=0;
-        uint64_t res5[5];
-        _ModMult(res5, tmp_a, tmp_b);
-        invZ2[0]=res5[0]; invZ2[1]=res5[1]; invZ2[2]=res5[2]; invZ2[3]=res5[3];
+    // x_affine = X * Z^{-2} mod P
+    uint64_t X5[5] = {Xi[0], Xi[1], Xi[2], Xi[3], 0};
+    uint64_t Xa5[5];
+    _ModMult(Xa5, X5, invZ2);
 
-        // x_affine = X * Z^{-2} mod P
-        uint64_t xa[4];
-        tmp_a[0]=Xi[0]; tmp_a[1]=Xi[1]; tmp_a[2]=Xi[2]; tmp_a[3]=Xi[3]; tmp_a[4]=0;
-        tmp_b[0]=invZ2[0]; tmp_b[1]=invZ2[1]; tmp_b[2]=invZ2[2]; tmp_b[3]=invZ2[3]; tmp_b[4]=0;
-        _ModMult(res5, tmp_a, tmp_b);
-        xa[0]=res5[0]; xa[1]=res5[1]; xa[2]=res5[2]; xa[3]=res5[3];
-
-        // r = xa mod n  (xa < P < 2^256，只需比較一次)
-        uint64_t DEV_N_local[4]={DEV_N[0],DEV_N[1],DEV_N[2],DEV_N[3]};
-        int ge = (xa[3]>DEV_N[3]) ||
-                 (xa[3]==DEV_N[3] && xa[2]>DEV_N[2]) ||
-                 (xa[3]==DEV_N[3] && xa[2]==DEV_N[2] && xa[1]>DEV_N[1]) ||
-                 (xa[3]==DEV_N[3] && xa[2]==DEV_N[2] && xa[1]==DEV_N[1] && xa[0]>=DEV_N[0]);
-        if (ge) {
-            ModSub256(ri, xa, DEV_N_local);
-        } else {
-            ri[0]=xa[0]; ri[1]=xa[1]; ri[2]=xa[2]; ri[3]=xa[3];
-        }
+    // r = x_affine mod n
+    uint64_t xa[4] = {Xa5[0], Xa5[1], Xa5[2], Xa5[3]};
+    uint64_t local_N[4] = {0xBFD25E8CD0364141ULL, 0xBAAEDCE6AF48A03BULL, 0xFFFFFFFFFFFFFFFEULL, 0xFFFFFFFFFFFFFFFFULL};
+    
+    int ge = (xa[3]>local_N[3]) ||
+             (xa[3]==local_N[3] && xa[2]>local_N[2]) ||
+             (xa[3]==local_N[3] && xa[2]==local_N[2] && xa[1]>local_N[1]) ||
+             (xa[3]==local_N[3] && xa[2]==local_N[2] && xa[1]==local_N[1] && xa[0]>=local_N[0]);
+    
+    if (ge) {
+        ModSub256(ri, xa, local_N);
+    } else {
+        ri[0]=xa[0]; ri[1]=xa[1]; ri[2]=xa[2]; ri[3]=xa[3];
     }
 }
 
@@ -378,19 +364,37 @@ __global__ void BatchConvertToR(
 // Xs:    [n * 4]  輸出 Jacobian X
 // Zs:    [n * 5]  輸出 Jacobian Z
 // ===========================================================================
+// ===========================================================================
+// 主 GPU Kernel：每個 thread 計算一個 k 的 k*G (Jacobian 座標)
+// k_start_limbs: 當前 batch 的起始 k 值
+// ===========================================================================
 __global__ void ComputeKG_Jacobian(
-    const uint64_t *k_in,
-    uint64_t       *Xs,
-    uint64_t       *Ys,
-    uint64_t       *Zs,
-    int             n)
+    uint64_t k0, uint64_t k1, uint64_t k2, uint64_t k3,
+    uint64_t *Xs,
+    uint64_t *Ys,
+    uint64_t *Zs,
+    int      n)
 {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= n) return;
 
-    const uint64_t *k = k_in + tid * 4;
-    uint64_t Rx[4], Ry[4], Rz[4];
+    // 計算當前 thread 的 k = k_start + tid
+    uint64_t k[4];
+    uint64_t carry = (uint64_t)tid;
+    
+    // Limb 0
+    k[0] = k0 + carry;
+    carry = (k[0] < k0) ? 1 : 0;
+    // Limb 1
+    k[1] = k1 + carry;
+    carry = (k[1] < k1) ? 1 : 0;
+    // Limb 2
+    k[2] = k2 + carry;
+    carry = (k[2] < k2) ? 1 : 0;
+    // Limb 3
+    k[3] = k3 + carry;
 
+    uint64_t Rx[4], Ry[4], Rz[4];
     ScalarMultG_Jacobian(Rx, Ry, Rz, k);
 
     uint64_t *Xo = Xs + tid * 4;
@@ -459,35 +463,35 @@ static void checkCuda(cudaError_t err, const char *msg) {
 // ===========================================================================
 // main
 // ===========================================================================
+// ===========================================================================
+// main
+// ===========================================================================
 int main(int argc, char **argv) {
-    int n = 16; // 預設計算 16 個 k 值
-    if (argc > 1) n = atoi(argv[1]);
-    if (n <= 0) { fprintf(stderr, "count 必須 > 0\n"); return 1; }
+    int n = 2097152; // 預設計算 2M 個 k 值 (RTX 3060 12G 資源更佳)
+    bool infinite = false;
 
-    // 起始 k 值（預設 1），支援 256-bit
+    if (argc > 1) {
+        n = atoi(argv[1]);
+        if (n == 0) {
+            n = 2097152;
+            infinite = true;
+        }
+    }
+    if (n <= 0) n = 1048576;
+
+    // 起始 k 值（預設 1）
     uint64_t k_start[4] = {1, 0, 0, 0};
     if (argc > 2) parse256(k_start, argv[2]);
     
-    // 檢查 k_start 是否為 0 (簡單檢查)
     if (k_start[0] == 0 && k_start[1] == 0 && k_start[2] == 0 && k_start[3] == 0) {
-        printf("警告: k_start 為 0，將從 1 開始計算。\n");
         k_start[0] = 1;
     }
 
-    // 預估所需 VRAM（每個 key 約 168 bytes）
-    size_t est_bytes = (size_t)n * 168;
-    size_t free_mem = 0, total_mem = 0;
-    cudaMemGetInfo(&free_mem, &total_mem);
-    if (est_bytes > free_mem) {
-        fprintf(stderr, "VRAM 不足：需要約 %.1f MB，GPU 剩餘 %.1f MB\n",
-                est_bytes / 1048576.0, free_mem / 1048576.0);
-        return 1;
-    }
-
-    printf("=== CalcR_GPU: secp256k1  r = x(k*G) mod n ===\n");
-    printf("計算 %d 個 k 值\n", n);
+    printf("=== CalcR_GPU: secp256k1  r = x(k*G) mod n (RTX 3060 Optimized) ===\n");
+    printf("批次大小: %d\n", n);
     printHex256("起始 k", k_start);
-    printf("\n");
+    if (infinite) printf("模式: 無盡循環 (Ctrl+C 停止)\n\n");
+    else printf("模式: 單次計算\n\n");
 
     // -----------------------------------------------------------------------
     // 上傳常數到 GPU
@@ -498,117 +502,79 @@ int main(int argc, char **argv) {
     checkCuda(cudaMemcpyToSymbol(DEV_GY, HOST_GY, 32), "cpyGy");
 
     // -----------------------------------------------------------------------
-    // CPU 產生 k 值 (k = k_start, k_start+1, ..., k_start+n-1)
-    // -----------------------------------------------------------------------
-    size_t k_bytes = (size_t)n * 4 * sizeof(uint64_t);
-    uint64_t *h_k = (uint64_t *)malloc(k_bytes);
-    for (int i = 0; i < n; i++) {
-        // 256-bit k = k_start + i  (little-endian limbs)
-        uint64_t carry = (uint64_t)i;
-        for (int j = 0; j < 4; j++) {
-            uint64_t val = k_start[j];
-            uint64_t res = val + carry;
-            h_k[i*4+j] = res;
-            carry = (res < val) ? 1 : 0;
-        }
-    }
-
-    // -----------------------------------------------------------------------
     // 分配 GPU 記憶體
     // -----------------------------------------------------------------------
-    uint64_t *d_k, *d_X, *d_Y, *d_Z, *d_r;
+    uint64_t *d_X, *d_Y, *d_Z, *d_r;
     size_t X_bytes = (size_t)n * 4 * sizeof(uint64_t);
     size_t Z_bytes = (size_t)n * 5 * sizeof(uint64_t);
 
-    checkCuda(cudaMalloc(&d_k, k_bytes), "malloc k");
     checkCuda(cudaMalloc(&d_X, X_bytes), "malloc X");
     checkCuda(cudaMalloc(&d_Y, X_bytes), "malloc Y");
     checkCuda(cudaMalloc(&d_Z, Z_bytes), "malloc Z");
     checkCuda(cudaMalloc(&d_r, X_bytes), "malloc r");
 
-    // -----------------------------------------------------------------------
-    // 複製 k 值到 GPU
-    // -----------------------------------------------------------------------
-    checkCuda(cudaMemcpy(d_k, h_k, k_bytes, cudaMemcpyHostToDevice), "cpy k H->D");
+    uint64_t *h_r = (uint64_t *)malloc(X_bytes);
+    uint64_t *h_k_first = (uint64_t *)malloc(32);
+    uint64_t *h_k_last = (uint64_t *)malloc(32);
 
-    // -----------------------------------------------------------------------
-    // 執行 Kernel 1：每個 thread 計算 k*G (Jacobian 座標)
-    // -----------------------------------------------------------------------
     int threads = 256;
     int blocks  = (n + threads - 1) / threads;
 
-    cudaEvent_t t0, t1;
-    cudaEventCreate(&t0);
-    cudaEventCreate(&t1);
-    cudaEventRecord(t0);
+    cudaEvent_t t_start, t_stop;
+    cudaEventCreate(&t_start);
+    cudaEventCreate(&t_stop);
 
-    ComputeKG_Jacobian<<<blocks, threads>>>(d_k, d_X, d_Y, d_Z, n);
-    checkCuda(cudaGetLastError(), "KG kernel");
+    do {
+        cudaEventRecord(t_start);
 
-    // -----------------------------------------------------------------------
-    // 執行 Kernel 2：Jacobian -> 仿射 x 座標 -> r = x mod n
-    // （單 thread，負責 batch Z-inversion + affine 轉換）
-    // -----------------------------------------------------------------------
-    BatchConvertToR<<<1, 1>>>(d_X, d_Z, d_r, n);
-    checkCuda(cudaGetLastError(), "BatchConvert kernel");
+        // -----------------------------------------------------------------------
+        // 執行 Kernel 1：GPU 生成 k 並計算 k*G (Jacobian)
+        // -----------------------------------------------------------------------
+        ComputeKG_Jacobian<<<blocks, threads>>>(k_start[0], k_start[1], k_start[2], k_start[3], d_X, d_Y, d_Z, n);
+        
+        // -----------------------------------------------------------------------
+        // 執行 Kernel 2：並行轉換 Jacobian -> Affine r
+        // -----------------------------------------------------------------------
+        ParallelConvertToR<<<blocks, threads>>>(d_X, d_Z, d_r, n);
+        
+        cudaEventRecord(t_stop);
+        checkCuda(cudaEventSynchronize(t_stop), "sync");
 
-    cudaEventRecord(t1);
-    cudaEventSynchronize(t1);
+        float ms = 0;
+        cudaEventElapsedTime(&ms, t_start, t_stop);
+        double speed = (double)n / (ms / 1000.0);
 
-    float ms = 0;
-    cudaEventElapsedTime(&ms, t0, t1);
-    printf("GPU 計算時間: %.3f ms  (%.0f keys/sec)\n\n", ms, n / (ms / 1000.0f));
+        // -----------------------------------------------------------------------
+        // 僅獲取第一筆與最後一筆結果以節省頻寬
+        // -----------------------------------------------------------------------
+        checkCuda(cudaMemcpy(h_r, d_r, 32, cudaMemcpyDeviceToHost), "cpy r first");
+        checkCuda(cudaMemcpy(h_r + (n-1)*4, d_r + (n-1)*4, 32, cudaMemcpyDeviceToHost), "cpy r last");
 
-    // -----------------------------------------------------------------------
-    // 複製結果回 CPU
-    // -----------------------------------------------------------------------
-    uint64_t *h_r = (uint64_t *)malloc(X_bytes);
-    checkCuda(cudaMemcpy(h_r, d_r, X_bytes, cudaMemcpyDeviceToHost), "cpy r D->H");
+        // 計算最後一筆的 k
+        uint64_t k_last[4];
+        uint64_t carry = (uint64_t)(n - 1);
+        for (int j = 0; j < 4; j++) {
+            k_last[j] = k_start[j] + carry;
+            carry = (k_last[j] < k_start[j]) ? 1 : 0;
+        }
 
-    // -----------------------------------------------------------------------
-    // 列印結果
-    // -----------------------------------------------------------------------
-    int print_max = (n <= 16) ? n : 5;
-    printf("=== 結果 (列印前 %d 筆) ===\n", print_max);
-    for (int i = 0; i < print_max; i++) {
-        char label[64];
-        snprintf(label, sizeof(label), "k-key[%d]", i + 1);
-        printHex256(label, h_k + i * 4);
-        printf("  r = ");
-        const uint64_t *rv = h_r + i * 4;
-        printf("%016llx%016llx%016llx%016llx\n", (unsigned long long)rv[3],
-               (unsigned long long)rv[2], (unsigned long long)rv[1],
-               (unsigned long long)rv[0]);
-    }
-    if (n > print_max) {
-        printf("... (共 %d 筆)\n", n);
-        printf("最後一筆:\n");
-        printHex256("k-key[last]", h_k + (n-1) * 4);
-        printf("  r = ");
-        const uint64_t *rv = h_r + (n-1) * 4;
-        printf("%016llx%016llx%016llx%016llx\n", (unsigned long long)rv[3],
-               (unsigned long long)rv[2], (unsigned long long)rv[1],
-               (unsigned long long)rv[0]);
-    }
+        // 列印
+        printf("-----------------------------------------------------------------------\n");
+        printf("Speed: %.2f keys/sec (Batch Time: %.2f ms)\n", speed, ms);
+        printHex256("Batch First k", k_start);
+        printHex256("            r", h_r);
+        printHex256("Batch Last  k", k_last);
+        printHex256("            r", h_r + (n-1)*4);
+        printf("\n");
 
-    printf("\n=== 已知正確值驗證 ===\n");
-    printf("k=1 期望: 79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798\n");
-    printf("k=2 期望: c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5\n");
-    printf("k=3 期望: f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9\n");
+        // 遞增 k_start 用於下一批次
+        carry = (uint64_t)n;
+        for (int j = 0; j < 4; j++) {
+            uint64_t val = k_start[j];
+            k_start[j] = val + carry;
+            carry = (k_start[j] < val) ? 1 : 0;
+        }
+    } while (infinite);
 
-    // -----------------------------------------------------------------------
-    // 釋放資源
-    // -----------------------------------------------------------------------
-    free(h_k);
-    free(h_r);
-    cudaFree(d_k);
-    cudaFree(d_X);
-    cudaFree(d_Y);
-    cudaFree(d_Z);
-    cudaFree(d_r);
-    cudaEventDestroy(t0);
-    cudaEventDestroy(t1);
-
-    printf("\n=== Done ===\n");
     return 0;
 }
