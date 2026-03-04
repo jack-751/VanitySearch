@@ -32,6 +32,7 @@ RUN apt-get update && \
     build-essential \
     cmake \
     pkg-config \
+    libhiredis-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Set up compiler symlinks so 'g++' resolves to g++-13

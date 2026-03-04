@@ -19,7 +19,7 @@
  *   最多只需 (n_keys/BATCH) 次 Batch Inverse，效率極高。
  *
  * 編譯 (在 /workspace 目錄下)：
- *   nvcc -O2 -arch=sm_86 -I. CalcR_GPU.cu -o CalcR_GPU
+ *   nvcc -O2 -arch=sm_86 -I. CalcR_GPU.cu -o CalcR_GPU -lhiredis
  *   (sm_86 = RTX 3xxx/Ada；依卡型調整)
  *
  * 執行：
@@ -33,6 +33,10 @@
 #include <cstring>
 #include <cstdint>
 #include <cuda_runtime.h>
+#include <unordered_set>
+#include <string>
+#include <vector>
+#include <hiredis/hiredis.h>
 
 // ===========================================================================
 // 引入 VanitySearch 的 GPU 數學庫
@@ -415,6 +419,97 @@ static void printHex256(const char *label, const uint64_t v[4]) {
            (unsigned long long)v[1], (unsigned long long)v[0]);
 }
 
+static std::string hex256(const uint64_t v[4]) {
+    char buf[65];
+    snprintf(buf, sizeof(buf), "%016llx%016llx%016llx%016llx",
+             (unsigned long long)v[3], (unsigned long long)v[2],
+             (unsigned long long)v[1], (unsigned long long)v[0]);
+    return std::string(buf);
+}
+
+// 提取最後 12 位十六進位字元 (48 bits)
+static std::string hex12(const uint64_t v[4]) {
+    char buf[13];
+    // 最後 12 位對應 v[0] 的低 48 位
+    snprintf(buf, sizeof(buf), "%012llx", (unsigned long long)(v[0] & 0xFFFFFFFFFFFFULL));
+    return std::string(buf);
+}
+
+// ===========================================================================
+// Redis Scanner Logic
+// ===========================================================================
+class RedisScanner {
+public:
+    redisContext *ctx = nullptr;
+
+    RedisScanner(const char *ip, int port) {
+        ctx = redisConnect(ip, port);
+        if (ctx == nullptr || ctx->err) {
+            if (ctx) printf("Redis Connection Error: %s\n", ctx->errstr);
+            else printf("Redis Connection Error: Can't allocate redis context\n");
+            exit(1);
+        }
+        printf("Connected to Redis: %s:%d\n", ip, port);
+        
+        // Select DB 0
+        redisReply *reply = (redisReply *)redisCommand(ctx, "SELECT 0");
+        freeReplyObject(reply);
+    }
+
+    ~RedisScanner() {
+        if (ctx) redisFree(ctx);
+    }
+
+    void checkMatchBatch(const uint64_t *ks_ptr, const uint64_t *rs_ptr, int n) {
+        if (n <= 0) return;
+
+        // 建立 SMISMEMBER 命令
+        // 格式: SMISMEMBER mongo_keys tag1 tag2 ... tagN
+        std::vector<const char*> argv;
+        std::vector<size_t> argvlen;
+
+        argv.push_back("SMISMEMBER");
+        argvlen.push_back(10);
+        argv.push_back("mongo_keys");
+        argvlen.push_back(10);
+
+        // 為了 SMISMEMBER，我們只需要最後 12 位字串
+        std::vector<std::string> tag_strings;
+        tag_strings.reserve(n);
+
+        for (int i = 0; i < n; i++) {
+            tag_strings.push_back(hex12(rs_ptr + i * 4));
+            argv.push_back(tag_strings.back().c_str());
+            argvlen.push_back(12);
+        }
+
+        redisReply *reply = (redisReply *)redisCommandArgv(ctx, argv.size(), argv.data(), argvlen.data());
+        
+        if (reply == nullptr) {
+            fprintf(stderr, "Redis error: %s\n", ctx->errstr);
+            return;
+        }
+
+        if (reply->type == REDIS_REPLY_ARRAY) {
+            for (size_t j = 0; j < reply->elements; j++) {
+                if (reply->element[j]->integer == 1) {
+                    // 命中！
+                    std::string ks = hex256(ks_ptr + j * 4);
+                    std::string rs = hex256(rs_ptr + j * 4); // 紀錄全長的 r
+                    std::string val = "{" + ks + ":" + rs + "}";
+                    
+                    printf("\n[MATCH FOUND!] k = %s\n", ks.c_str());
+                    printf("               r = %s\n", rs.c_str());
+
+                    redisReply *set_reply = (redisReply *)redisCommand(ctx, "SET match:%s %s", ks.c_str(), val.c_str());
+                    freeReplyObject(set_reply);
+                }
+            }
+        }
+        freeReplyObject(reply);
+    }
+};
+
 // 解析 256-bit 字串 (支援 0x 十六進位或十進位)
 static void parse256(uint64_t r[4], const char *s) {
     memset(r, 0, 32);
@@ -514,11 +609,11 @@ int main(int argc, char **argv) {
     checkCuda(cudaMalloc(&d_r, X_bytes), "malloc r");
 
     uint64_t *h_r = (uint64_t *)malloc(X_bytes);
-    uint64_t *h_k_first = (uint64_t *)malloc(32);
-    uint64_t *h_k_last = (uint64_t *)malloc(32);
 
     int threads = 256;
     int blocks  = (n + threads - 1) / threads;
+
+    RedisScanner scanner("host.docker.internal", 6379);
 
     cudaEvent_t t_start, t_stop;
     cudaEventCreate(&t_start);
@@ -528,13 +623,9 @@ int main(int argc, char **argv) {
         cudaEventRecord(t_start);
 
         // -----------------------------------------------------------------------
-        // 執行 Kernel 1：GPU 生成 k 並計算 k*G (Jacobian)
+        // 執行運算
         // -----------------------------------------------------------------------
         ComputeKG_Jacobian<<<blocks, threads>>>(k_start[0], k_start[1], k_start[2], k_start[3], d_X, d_Y, d_Z, n);
-        
-        // -----------------------------------------------------------------------
-        // 執行 Kernel 2：並行轉換 Jacobian -> Affine r
-        // -----------------------------------------------------------------------
         ParallelConvertToR<<<blocks, threads>>>(d_X, d_Z, d_r, n);
         
         cudaEventRecord(t_stop);
@@ -542,15 +633,27 @@ int main(int argc, char **argv) {
 
         float ms = 0;
         cudaEventElapsedTime(&ms, t_start, t_stop);
+
+        // -----------------------------------------------------------------------
+        // 比對 Redis (使用 SMISMEMBER 批次查詢)
+        // -----------------------------------------------------------------------
+        checkCuda(cudaMemcpy(h_r, d_r, X_bytes, cudaMemcpyDeviceToHost), "cpy r all");
+
+        // 預先計算本批次的所有 k 值
+        std::vector<uint64_t> h_k(n * 4);
+        for (int i = 0; i < n; i++) {
+            uint64_t carry = (uint64_t)i;
+            for (int j = 0; j < 4; j++) {
+                h_k[i * 4 + j] = k_start[j] + carry;
+                carry = (h_k[i * 4 + j] < k_start[j]) ? 1 : 0;
+            }
+        }
+
+        scanner.checkMatchBatch(h_k.data(), h_r, n);
+
         double speed = (double)n / (ms / 1000.0);
 
-        // -----------------------------------------------------------------------
-        // 僅獲取第一筆與最後一筆結果以節省頻寬
-        // -----------------------------------------------------------------------
-        checkCuda(cudaMemcpy(h_r, d_r, 32, cudaMemcpyDeviceToHost), "cpy r first");
-        checkCuda(cudaMemcpy(h_r + (n-1)*4, d_r + (n-1)*4, 32, cudaMemcpyDeviceToHost), "cpy r last");
-
-        // 計算最後一筆的 k
+        // 列印批次摘要
         uint64_t k_last[4];
         uint64_t carry = (uint64_t)(n - 1);
         for (int j = 0; j < 4; j++) {
@@ -558,7 +661,6 @@ int main(int argc, char **argv) {
             carry = (k_last[j] < k_start[j]) ? 1 : 0;
         }
 
-        // 列印
         printf("-----------------------------------------------------------------------\n");
         printf("Speed: %.2f keys/sec (Batch Time: %.2f ms)\n", speed, ms);
         printHex256("Batch First k", k_start);
@@ -567,7 +669,7 @@ int main(int argc, char **argv) {
         printHex256("            r", h_r + (n-1)*4);
         printf("\n");
 
-        // 遞增 k_start 用於下一批次
+        // 遞增 k_start
         carry = (uint64_t)n;
         for (int j = 0; j < 4; j++) {
             uint64_t val = k_start[j];

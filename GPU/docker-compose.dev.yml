@@ -24,3 +24,5 @@ services:
               capabilities: [ gpu ]
     # Restart policy: only start when explicitly requested
     restart: "no"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
