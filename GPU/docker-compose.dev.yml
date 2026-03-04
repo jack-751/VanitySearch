@@ -1,0 +1,26 @@
+services:
+  dev:
+    build:
+      context: .
+      dockerfile: dev.Dockerfile
+      args:
+        CUDA: "13.1.1-cudnn-devel-ubuntu24.04"
+    image: vanitysearch_gpu:dev
+    container_name: vanitysearch_gpu_dev
+    # Mount the project root into /workspace so edits on host are reflected inside
+    volumes:
+      - .:/workspace
+    working_dir: /workspace
+    # Keep container alive so you can exec into it
+    stdin_open: true
+    tty: true
+    # GPU passthrough — requires NVIDIA Container Toolkit on the host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [ gpu ]
+    # Restart policy: only start when explicitly requested
+    restart: "no"
