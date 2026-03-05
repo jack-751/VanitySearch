@@ -704,9 +704,22 @@ public:
                         }
 
                         // 2. 拿 r 值，連到 btc 集合查詢 id 欄位
+                        // 同時查詢: r, 0+r, 00+r
+                        std::string r0 = "0" + rs;
+                        std::string r00 = "00" + rs;
+
+                        // 使用 $in 查詢: { "id": { "$in": [rs, r0, r00] } }
                         bson_t *query = bson_new();
-                        BSON_APPEND_UTF8(query, "id", rs.c_str());
-                        
+                        bson_t in_child;
+                        BSON_APPEND_DOCUMENT_BEGIN(query, "id", &in_child);
+                        bson_t in_array;
+                        BSON_APPEND_ARRAY_BEGIN(&in_child, "$in", &in_array);
+                        BSON_APPEND_UTF8(&in_array, "0", rs.c_str());
+                        BSON_APPEND_UTF8(&in_array, "1", r0.c_str());
+                        BSON_APPEND_UTF8(&in_array, "2", r00.c_str());
+                        bson_append_array_end(&in_child, &in_array);
+                        bson_append_document_end(query, &in_child);
+
                         mongoc_cursor_t *cursor = mongoc_collection_find_with_opts(btc_col, query, NULL, NULL);
                         const bson_t *found_btc_doc;
                         bool is_precise_match = mongoc_cursor_next(cursor, &found_btc_doc);
