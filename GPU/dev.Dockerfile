@@ -33,6 +33,8 @@ RUN apt-get update && \
     cmake \
     pkg-config \
     libhiredis-dev \
+    libmongoc-dev \
+    libbson-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Set up compiler symlinks so 'g++' resolves to g++-13

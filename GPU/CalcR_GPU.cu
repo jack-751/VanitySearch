@@ -19,7 +19,7 @@
  *   最多只需 (n_keys/BATCH) 次 Batch Inverse，效率極高。
  *
  * 編譯 (在 /workspace 目錄下)：
- *   nvcc -O2 -arch=sm_86 -I. CalcR_GPU.cu -o CalcR_GPU -lhiredis
+ *   nvcc -O2 -arch=sm_86 -I. CalcR_GPU.cu -o CalcR_GPU -lhiredis $(pkg-config --cflags --libs libmongoc-1.0)
  *   (sm_86 = RTX 3xxx/Ada；依卡型調整)
  *
  * 執行：
@@ -42,6 +42,9 @@
 #include <queue>
 #include <atomic>
 #include <hiredis/hiredis.h>
+#include <mongoc/mongoc.h>
+#include <bson/bson.h>
+#include <ctime>
 
 // ===========================================================================
 // 引入 VanitySearch 的 GPU 數學庫
@@ -597,35 +600,51 @@ public:
 };
 
 // ===========================================================================
-// Redis Scanner Logic
+// Hybrid Scanner Logic (Redis + MongoDB)
 // ===========================================================================
-class RedisScanner {
+class HybridScanner {
 public:
-    redisContext *ctx = nullptr;
+    redisContext *redis_ctx = nullptr;
+    mongoc_client_t *mongo_client = nullptr;
+    mongoc_collection_t *match_col = nullptr;
+    mongoc_collection_t *btc_col = nullptr;
     char* tag_buffer = nullptr;
     int current_n = 0;
 
-    RedisScanner(const char *ip, int port) {
-        ctx = redisConnect(ip, port);
-        if (ctx == nullptr || ctx->err) {
-            if (ctx) printf("Redis Connection Error: %s\n", ctx->errstr);
+    HybridScanner(const char *redis_ip, int redis_port, const char *mongo_uri) {
+        // Connect to Redis
+        redis_ctx = redisConnect(redis_ip, redis_port);
+        if (redis_ctx == nullptr || redis_ctx->err) {
+            if (redis_ctx) printf("Redis Connection Error: %s\n", redis_ctx->errstr);
             else printf("Redis Connection Error: Can't allocate redis context\n");
             exit(1);
         }
-        
-        redisReply *reply = (redisReply *)redisCommand(ctx, "SELECT 0");
+        redisReply *reply = (redisReply *)redisCommand(redis_ctx, "SELECT 0");
         freeReplyObject(reply);
+
+        // Connect to MongoDB (mongoc_init() must be called once in main)
+        mongo_client = mongoc_client_new(mongo_uri);
+        if (!mongo_client) {
+            printf("MongoDB Connection Error: Failed to parse URI\n");
+            exit(1);
+        }
+        match_col = mongoc_client_get_collection(mongo_client, "ecdsa", "match");
+        btc_col = mongoc_client_get_collection(mongo_client, "ecdsa", "btc");
     }
 
-    ~RedisScanner() {
-        if (ctx) redisFree(ctx);
+    ~HybridScanner() {
+        if (redis_ctx) redisFree(redis_ctx);
         if (tag_buffer) delete[] tag_buffer;
+
+        if (match_col) mongoc_collection_destroy(match_col);
+        if (btc_col) mongoc_collection_destroy(btc_col);
+        if (mongo_client) mongoc_client_destroy(mongo_client);
     }
 
     void checkMatchBatch(const uint64_t k_start[4], const uint64_t *rs_ptr, int n) {
         if (n <= 0) return;
 
-        const int sub_batch_size = 50000; // 增加到 5 萬增加 Redis 吞吐量
+        const int sub_batch_size = 50000;
         
         if (sub_batch_size > current_n) {
             if (tag_buffer) delete[] tag_buffer;
@@ -650,17 +669,17 @@ public:
                 argvlen.push_back(12);
             }
 
-            redisReply *reply = (redisReply *)redisCommandArgv(ctx, argv.size(), argv.data(), argvlen.data());
+            redisReply *reply = (redisReply *)redisCommandArgv(redis_ctx, argv.size(), argv.data(), argvlen.data());
             
             if (reply == nullptr) {
-                fprintf(stderr, "Redis error: %s\n", ctx->errstr);
+                fprintf(stderr, "Redis error: %s\n", redis_ctx->errstr);
                 continue;
             }
 
             if (reply->type == REDIS_REPLY_ARRAY) {
                 for (size_t j = 0; j < reply->elements; j++) {
                     if (reply->element[j]->integer == 1) {
-                        // 命中！還原 k 值
+                        // Redis 命中！還原 k 值
                         uint64_t k_match[4];
                         uint64_t carry = (uint64_t)(start + j);
                         for (int limb = 0; limb < 4; limb++) {
@@ -670,13 +689,52 @@ public:
 
                         std::string ks = hex256(k_match);
                         std::string rs = hex256(rs_ptr + (start + j) * 4);
-                        std::string val = "{" + ks + ":" + rs + "}";
                         
                         printf("\n[MATCH FOUND!] k = %s\n", ks.c_str());
                         printf("               r = %s\n", rs.c_str());
 
-                        redisReply *set_reply = (redisReply *)redisCommand(ctx, "SET match:%s %s", ks.c_str(), val.c_str());
-                        freeReplyObject(set_reply);
+                        // 1. 寫入 MongoDB 的 match 集合 (r值跟k值)
+                        bson_t *doc = bson_new();
+                        BSON_APPEND_UTF8(doc, "r", rs.c_str());
+                        BSON_APPEND_UTF8(doc, "k", ks.c_str());
+                        
+                        bson_error_t error;
+                        if (!mongoc_collection_insert_one(match_col, doc, NULL, NULL, &error)) {
+                            fprintf(stderr, "MongoDB Insert Error: %s\n", error.message);
+                        }
+
+                        // 2. 拿 r 值，連到 btc 集合查詢 id 欄位
+                        bson_t *query = bson_new();
+                        BSON_APPEND_UTF8(query, "id", rs.c_str());
+                        
+                        mongoc_cursor_t *cursor = mongoc_collection_find_with_opts(btc_col, query, NULL, NULL);
+                        const bson_t *found_btc_doc;
+                        bool is_precise_match = mongoc_cursor_next(cursor, &found_btc_doc);
+                        
+                        if (is_precise_match) {
+                            // 3. 若符合，更新 match 資料為符合 (y值) 並寫下時間
+                            bson_t *selector = bson_new();
+                            BSON_APPEND_UTF8(selector, "r", rs.c_str());
+                            BSON_APPEND_UTF8(selector, "k", ks.c_str());
+
+                            bson_t *update = bson_new();
+                            bson_t child;
+                            BSON_APPEND_DOCUMENT_BEGIN(update, "$set", &child);
+                            BSON_APPEND_UTF8(&child, "found", "y");
+                            BSON_APPEND_TIME_T(&child, "time", time(NULL));
+                            bson_append_document_end(update, &child);
+
+                            if (!mongoc_collection_update_one(match_col, selector, update, NULL, NULL, &error)) {
+                                fprintf(stderr, "MongoDB Update Error: %s\n", error.message);
+                            }
+                            bson_destroy(selector);
+                            bson_destroy(update);
+                            printf("               [PRECISE MATCH!] Updated with found='y'\n");
+                        }
+                        
+                        mongoc_cursor_destroy(cursor);
+                        bson_destroy(query);
+                        bson_destroy(doc);
                     }
                 }
             }
@@ -746,6 +804,9 @@ int main(int argc, char **argv) {
     printf("批次大小: %d\n", n);
     printHex256("起始 k", k_start);
     
+    // Initialize MongoDB Driver (Global)
+    mongoc_init();
+
     checkCuda(cudaMemcpyToSymbol(DEV_P,  HOST_P,  32), "cpyP");
     checkCuda(cudaMemcpyToSymbol(DEV_N,  HOST_N,  32), "cpyN");
     checkCuda(cudaMemcpyToSymbol(DEV_GX, HOST_GX, 32), "cpyGx");
@@ -783,7 +844,7 @@ int main(int argc, char **argv) {
     std::vector<std::thread> workers;
     for (int i = 0; i < num_workers; i++) {
         workers.emplace_back([&task_queue, &free_indices, streams]() {
-            RedisScanner scanner("host.docker.internal", 6379);
+            HybridScanner scanner("host.docker.internal", 6379, "mongodb://host.docker.internal:27017");
             while (true) {
                 BatchTask task = task_queue.pop();
                 if (task.n == -1) break; // Sentinel to exit
@@ -859,6 +920,9 @@ int main(int argc, char **argv) {
         task_queue.push(sentinel);
     }
     for (auto &t : workers) t.join();
+
+    // Cleanup MongoDB Driver (Global)
+    mongoc_cleanup();
 
     return 0;
 }
