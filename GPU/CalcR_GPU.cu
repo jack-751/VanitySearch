@@ -549,13 +549,13 @@ static void to_hex256(char *dest, const uint64_t v[4]) {
     dest[64] = '\0';
 }
 
-static void to_hex48(char *dest, uint64_t v0) {
-    uint64_t val = v0 & 0xFFFFFFFFFFFFULL;
-    for (int j = 11; j >= 0; j--) {
+static void to_hex44(char *dest, uint64_t v0) {
+    uint64_t val = v0 & 0xFFFFFFFFFFFULL;
+    for (int j = 10; j >= 0; j--) {
         dest[j] = HEX_CHARS[val & 0xf];
         val >>= 4;
     }
-    dest[12] = '\0';
+    dest[11] = '\0';
 }
 
 static std::string hex256(const uint64_t v[4]) {
@@ -599,19 +599,111 @@ public:
     }
 };
 
+struct MatchData {
+    std::string k;
+    std::string r;
+    bool exit_signal = false;
+};
+
+SafeQueue<MatchData> g_match_queue;
+
+void MongoMatchLogger(const char* mongo_uri, const char* redis_ip, int redis_port) {
+    mongoc_client_t *client = mongoc_client_new(mongo_uri);
+    if (!client) {
+        fprintf(stderr, "MatchLogger: Failed to parse MongoDB URI\n");
+        return;
+    }
+    mongoc_collection_t *match_col = mongoc_client_get_collection(client, "ecdsa", "match");
+    mongoc_collection_t *btc_col = mongoc_client_get_collection(client, "ecdsa", "btc");
+
+    // Connect to Redis for managing the matched keys set
+    redisContext *redis_ctx = redisConnect(redis_ip, redis_port);
+    if (redis_ctx == nullptr || redis_ctx->err) {
+        fprintf(stderr, "MatchLogger: Redis Connection Error\n");
+        if (redis_ctx) redisFree(redis_ctx);
+        // Continue without Redis if it fails, or you could exit. We will continue and just skip Redis ops.
+    } else {
+        redisReply *reply = (redisReply *)redisCommand(redis_ctx, "SELECT 0");
+        if (reply) freeReplyObject(reply);
+    }
+
+    while (true) {
+        MatchData data = g_match_queue.pop();
+        if (data.exit_signal) break;
+
+        std::string ks = data.k;
+        std::string rs = data.r;
+        std::string redis_val = rs + ":" + ks;
+
+        // 1. Write the found match (r:k) into Redis Set
+        if (redis_ctx && !redis_ctx->err) {
+            redisReply *reply = (redisReply *)redisCommand(redis_ctx, "SADD matched_candidates %s", redis_val.c_str());
+            if (reply) freeReplyObject(reply);
+        }
+
+        // 2. Query MongoDB btc collection
+        std::string r0 = "0" + rs;
+        std::string r00 = "00" + rs;
+
+        // Query using $in: { "_id": { "$in": [rs, r0, r00] } }
+        bson_t *query = bson_new();
+        bson_t in_child;
+        BSON_APPEND_DOCUMENT_BEGIN(query, "_id", &in_child);
+        bson_t in_array;
+        BSON_APPEND_ARRAY_BEGIN(&in_child, "$in", &in_array);
+        BSON_APPEND_UTF8(&in_array, "0", rs.c_str());
+        BSON_APPEND_UTF8(&in_array, "1", r0.c_str());
+        BSON_APPEND_UTF8(&in_array, "2", r00.c_str());
+        bson_append_array_end(&in_child, &in_array);
+        bson_append_document_end(query, &in_child);
+
+        mongoc_cursor_t *cursor = mongoc_collection_find_with_opts(btc_col, query, NULL, NULL);
+        const bson_t *found_btc_doc;
+        bool is_precise_match = mongoc_cursor_next(cursor, &found_btc_doc);
+        
+        if (is_precise_match) {
+            // Precise match found! Write to MongoDB match collection.
+            bson_t *doc = bson_new();
+            BSON_APPEND_UTF8(doc, "r", rs.c_str());
+            BSON_APPEND_UTF8(doc, "k", ks.c_str());
+            BSON_APPEND_UTF8(doc, "found", "y");
+            BSON_APPEND_TIME_T(doc, "time", time(NULL));
+            
+            bson_error_t error;
+            if (!mongoc_collection_insert_one(match_col, doc, NULL, NULL, &error)) {
+                fprintf(stderr, "MongoDB Insert Error: %s\n", error.message);
+            }
+            bson_destroy(doc);
+            
+            printf("               [PRECISE MATCH FOUND IN BG!] Inserted into match col for r=%s\n", rs.c_str());
+        } else {
+            // Not a precise match. Remove from Redis Set.
+            if (redis_ctx && !redis_ctx->err) {
+                redisReply *reply = (redisReply *)redisCommand(redis_ctx, "SREM matched_candidates %s", redis_val.c_str());
+                if (reply) freeReplyObject(reply);
+            }
+        }
+        
+        mongoc_cursor_destroy(cursor);
+        bson_destroy(query);
+    }
+
+    if (redis_ctx) redisFree(redis_ctx);
+    mongoc_collection_destroy(match_col);
+    mongoc_collection_destroy(btc_col);
+    mongoc_client_destroy(client);
+}
+
 // ===========================================================================
 // Hybrid Scanner Logic (Redis + MongoDB)
 // ===========================================================================
 class HybridScanner {
 public:
     redisContext *redis_ctx = nullptr;
-    mongoc_client_t *mongo_client = nullptr;
-    mongoc_collection_t *match_col = nullptr;
-    mongoc_collection_t *btc_col = nullptr;
     char* tag_buffer = nullptr;
     int current_n = 0;
 
-    HybridScanner(const char *redis_ip, int redis_port, const char *mongo_uri) {
+    HybridScanner(const char *redis_ip, int redis_port) {
         // Connect to Redis
         redis_ctx = redisConnect(redis_ip, redis_port);
         if (redis_ctx == nullptr || redis_ctx->err) {
@@ -621,24 +713,11 @@ public:
         }
         redisReply *reply = (redisReply *)redisCommand(redis_ctx, "SELECT 0");
         freeReplyObject(reply);
-
-        // Connect to MongoDB (mongoc_init() must be called once in main)
-        mongo_client = mongoc_client_new(mongo_uri);
-        if (!mongo_client) {
-            printf("MongoDB Connection Error: Failed to parse URI\n");
-            exit(1);
-        }
-        match_col = mongoc_client_get_collection(mongo_client, "ecdsa", "match");
-        btc_col = mongoc_client_get_collection(mongo_client, "ecdsa", "btc");
     }
 
     ~HybridScanner() {
         if (redis_ctx) redisFree(redis_ctx);
         if (tag_buffer) delete[] tag_buffer;
-
-        if (match_col) mongoc_collection_destroy(match_col);
-        if (btc_col) mongoc_collection_destroy(btc_col);
-        if (mongo_client) mongoc_client_destroy(mongo_client);
     }
 
     void checkMatchBatch(const uint64_t k_start[4], const uint64_t *rs_ptr, int n) {
@@ -648,7 +727,7 @@ public:
         
         if (sub_batch_size > current_n) {
             if (tag_buffer) delete[] tag_buffer;
-            tag_buffer = new char[sub_batch_size * 13];
+            tag_buffer = new char[sub_batch_size * 12];
             current_n = sub_batch_size;
         }
 
@@ -657,6 +736,8 @@ public:
 
             std::vector<const char*> argv;
             std::vector<size_t> argvlen;
+            argv.reserve(current_batch + 2);
+            argvlen.reserve(current_batch + 2);
 
             argv.push_back("SMISMEMBER");
             argvlen.push_back(10);
@@ -664,9 +745,9 @@ public:
             argvlen.push_back(10);
 
             for (int i = 0; i < current_batch; i++) {
-                to_hex48(tag_buffer + i * 13, rs_ptr[(start + i) * 4]);
-                argv.push_back(tag_buffer + i * 13);
-                argvlen.push_back(12);
+                to_hex44(tag_buffer + i * 12, rs_ptr[(start + i) * 4]);
+                argv.push_back(tag_buffer + i * 12);
+                argvlen.push_back(11);
             }
 
             redisReply *reply = (redisReply *)redisCommandArgv(redis_ctx, argv.size(), argv.data(), argvlen.data());
@@ -689,65 +770,12 @@ public:
 
                         std::string ks = hex256(k_match);
                         std::string rs = hex256(rs_ptr + (start + j) * 4);
-                        
-                        printf("\n[MATCH FOUND!] k = %s\n", ks.c_str());
-                        printf("               r = %s\n", rs.c_str());
 
-                        // 1. 寫入 MongoDB 的 match 集合 (r值跟k值)
-                        bson_t *doc = bson_new();
-                        BSON_APPEND_UTF8(doc, "r", rs.c_str());
-                        BSON_APPEND_UTF8(doc, "k", ks.c_str());
-                        
-                        bson_error_t error;
-                        if (!mongoc_collection_insert_one(match_col, doc, NULL, NULL, &error)) {
-                            fprintf(stderr, "MongoDB Insert Error: %s\n", error.message);
-                        }
-
-                        // 2. 拿 r 值，連到 btc 集合查詢 id 欄位
-                        // 同時查詢: r, 0+r, 00+r
-                        std::string r0 = "0" + rs;
-                        std::string r00 = "00" + rs;
-
-                        // 使用 $in 查詢: { "id": { "$in": [rs, r0, r00] } }
-                        bson_t *query = bson_new();
-                        bson_t in_child;
-                        BSON_APPEND_DOCUMENT_BEGIN(query, "id", &in_child);
-                        bson_t in_array;
-                        BSON_APPEND_ARRAY_BEGIN(&in_child, "$in", &in_array);
-                        BSON_APPEND_UTF8(&in_array, "0", rs.c_str());
-                        BSON_APPEND_UTF8(&in_array, "1", r0.c_str());
-                        BSON_APPEND_UTF8(&in_array, "2", r00.c_str());
-                        bson_append_array_end(&in_child, &in_array);
-                        bson_append_document_end(query, &in_child);
-
-                        mongoc_cursor_t *cursor = mongoc_collection_find_with_opts(btc_col, query, NULL, NULL);
-                        const bson_t *found_btc_doc;
-                        bool is_precise_match = mongoc_cursor_next(cursor, &found_btc_doc);
-                        
-                        if (is_precise_match) {
-                            // 3. 若符合，更新 match 資料為符合 (y值) 並寫下時間
-                            bson_t *selector = bson_new();
-                            BSON_APPEND_UTF8(selector, "r", rs.c_str());
-                            BSON_APPEND_UTF8(selector, "k", ks.c_str());
-
-                            bson_t *update = bson_new();
-                            bson_t child;
-                            BSON_APPEND_DOCUMENT_BEGIN(update, "$set", &child);
-                            BSON_APPEND_UTF8(&child, "found", "y");
-                            BSON_APPEND_TIME_T(&child, "time", time(NULL));
-                            bson_append_document_end(update, &child);
-
-                            if (!mongoc_collection_update_one(match_col, selector, update, NULL, NULL, &error)) {
-                                fprintf(stderr, "MongoDB Update Error: %s\n", error.message);
-                            }
-                            bson_destroy(selector);
-                            bson_destroy(update);
-                            printf("               [PRECISE MATCH!] Updated with found='y'\n");
-                        }
-                        
-                        mongoc_cursor_destroy(cursor);
-                        bson_destroy(query);
-                        bson_destroy(doc);
+                        // 丟入背景佇列處理 MongoDB
+                        MatchData mdata;
+                        mdata.k = ks;
+                        mdata.r = rs;
+                        g_match_queue.push(mdata);
                     }
                 }
             }
@@ -854,10 +882,12 @@ int main(int argc, char **argv) {
     SafeQueue<int> free_indices;
     for (int i = 0; i < num_streams; i++) free_indices.push(i);
 
+    std::thread mongo_logger(MongoMatchLogger, "mongodb://127.0.0.1:27017", "127.0.0.1", 6379);
+
     std::vector<std::thread> workers;
     for (int i = 0; i < num_workers; i++) {
         workers.emplace_back([&task_queue, &free_indices, streams]() {
-            HybridScanner scanner("host.docker.internal", 6379, "mongodb://host.docker.internal:27017");
+            HybridScanner scanner("127.0.0.1", 6379);
             while (true) {
                 BatchTask task = task_queue.pop();
                 if (task.n == -1) break; // Sentinel to exit
@@ -933,6 +963,12 @@ int main(int argc, char **argv) {
         task_queue.push(sentinel);
     }
     for (auto &t : workers) t.join();
+
+    // Shutdown mongo logger
+    MatchData m_sentinel;
+    m_sentinel.exit_signal = true;
+    g_match_queue.push(m_sentinel);
+    mongo_logger.join();
 
     // Cleanup MongoDB Driver (Global)
     mongoc_cleanup();
