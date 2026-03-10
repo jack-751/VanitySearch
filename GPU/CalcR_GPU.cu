@@ -45,6 +45,10 @@
 #include <mongoc/mongoc.h>
 #include <bson/bson.h>
 #include <ctime>
+#include <cmath>
+#include <chrono>
+
+static void checkCuda(cudaError_t err, const char *msg);
 
 // ===========================================================================
 // 引入 VanitySearch 的 GPU 數學庫
@@ -477,6 +481,64 @@ __global__ void ParallelConvertToR(
 }
 
 // ===========================================================================
+// ===========================================================================
+// GPU Bloom Filter Kernels
+// ===========================================================================
+
+// 用於 GPU Bloom Filter 的 Hash 函數 (針對 11-char hex 字符串)
+__device__ __forceinline__ uint64_t gpu_hash_hex11(const char* hex_str, uint32_t seed) {
+    uint64_t h = seed;
+    for (int i = 0; i < 11; i++) {
+        char c = hex_str[i];
+        uint8_t v = (c >= '0' && c <= '9') ? (c - '0') : (c - 'a' + 10);
+        h = h * 31 + v;
+        h ^= h >> 33;
+        h *= 0xff51afd7ed558ccdULL;
+        h ^= h >> 33;
+    }
+    return h;
+}
+
+// GPU Kernel: 將 hex 字符串批量添加到 Bloom Filter
+// 每個 thread 負責一個 key
+__global__ void gpu_bloom_add_batch(uint64_t *bloom_bits, uint64_t num_bits, int num_hashes, 
+                                   const char* hex_keys, int num_keys, int str_len) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_keys) return;
+
+    const char* key = hex_keys + tid * str_len;
+    
+    for (int i = 0; i < num_hashes; i++) {
+        uint64_t h = gpu_hash_hex11(key, i) % num_bits;
+        size_t word_idx = h / 64;
+        size_t bit_idx = h % 64;
+        atomicOr((unsigned long long*)&bloom_bits[word_idx], 1ULL << bit_idx);
+    }
+}
+
+// GPU Kernel: 查詢 Bloom Filter（批量）
+// 每個 thread 負責一個 key，寫結果到 results 陣列
+__global__ void gpu_bloom_query_batch(uint64_t *bloom_bits, uint64_t num_bits, int num_hashes,
+                                      const char* hex_keys, int num_keys, int str_len, uint8_t* results) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_keys) return;
+
+    const char* key = hex_keys + tid * str_len;
+    
+    bool possibly_contains = true;
+    for (int i = 0; i < num_hashes; i++) {
+        uint64_t h = gpu_hash_hex11(key, i) % num_bits;
+        size_t word_idx = h / 64;
+        size_t bit_idx = h % 64;
+        if (!(bloom_bits[word_idx] & (1ULL << bit_idx))) {
+            possibly_contains = false;
+            break;
+        }
+    }
+    
+    results[tid] = possibly_contains ? 1 : 0;  // 1: 可能存在, 0: 確定不存在
+}
+
 // 主 GPU Kernel：每個 thread 計算一個 k 的 k*G (Jacobian 座標)
 // k_in:  [n * 4]  輸入 k 值 (4 × uint64, 小端)
 // Xs:    [n * 4]  輸出 Jacobian X
@@ -606,6 +668,9 @@ struct MatchData {
 };
 
 SafeQueue<MatchData> g_match_queue;
+std::atomic<unsigned long long> g_stat_total_scanned(0);
+std::atomic<unsigned long long> g_stat_bloom_filtered(0);
+std::atomic<unsigned long long> g_stat_redis_queried(0);
 
 void MongoMatchLogger(const char* mongo_uri, const char* redis_ip, int redis_port) {
     mongoc_client_t *client = mongoc_client_new(mongo_uri);
@@ -701,9 +766,16 @@ class HybridScanner {
 public:
     redisContext *redis_ctx = nullptr;
     char* tag_buffer = nullptr;
+    uint8_t* bloom_host_results = nullptr;
     int current_n = 0;
 
-    HybridScanner(const char *redis_ip, int redis_port) {
+        HybridScanner(const char *redis_ip, int redis_port,
+                                    uint64_t *dev_bloom, uint64_t bloom_bits_count, int bloom_hash_count,
+                                    std::atomic<bool> *bloom_ready)
+                : dev_bloom_bits(dev_bloom),
+                    bloom_num_bits(bloom_bits_count),
+                    bloom_num_hashes(bloom_hash_count),
+                    bloom_ready_flag(bloom_ready) {
         // Connect to Redis
         redis_ctx = redisConnect(redis_ip, redis_port);
         if (redis_ctx == nullptr || redis_ctx->err) {
@@ -713,12 +785,29 @@ public:
         }
         redisReply *reply = (redisReply *)redisCommand(redis_ctx, "SELECT 0");
         freeReplyObject(reply);
+
+        // Per-worker GPU buffers for Bloom prefilter.
+        const int sub_batch_size = 50000;
+        checkCuda(cudaMalloc(&dev_bloom_results, sub_batch_size * sizeof(uint8_t)), "scanner bloom results malloc");
+        checkCuda(cudaMalloc(&dev_hex_buffer, sub_batch_size * 12), "scanner hex buffer malloc");
     }
 
     ~HybridScanner() {
         if (redis_ctx) redisFree(redis_ctx);
         if (tag_buffer) delete[] tag_buffer;
+        if (bloom_host_results) delete[] bloom_host_results;
+        if (dev_bloom_results) cudaFree(dev_bloom_results);
+        if (dev_hex_buffer) cudaFree(dev_hex_buffer);
     }
+
+    // GPU Bloom Filter 成員
+    uint64_t *dev_bloom_bits = nullptr;
+    uint64_t bloom_num_bits = 0;
+    int bloom_num_hashes = 0;
+    std::atomic<bool> *bloom_ready_flag = nullptr;
+    
+    uint8_t *dev_bloom_results = nullptr;  // GPU結果緩衝區
+    char *dev_hex_buffer = nullptr;         // GPU Hex字符串緩衝區
 
     void checkMatchBatch(const uint64_t k_start[4], const uint64_t *rs_ptr, int n) {
         if (n <= 0) return;
@@ -727,26 +816,72 @@ public:
         
         if (sub_batch_size > current_n) {
             if (tag_buffer) delete[] tag_buffer;
+            if (bloom_host_results) delete[] bloom_host_results;
             tag_buffer = new char[sub_batch_size * 12];
+            bloom_host_results = new uint8_t[sub_batch_size];
             current_n = sub_batch_size;
         }
 
         for (int start = 0; start < n; start += sub_batch_size) {
             int current_batch = (n - start < sub_batch_size) ? (n - start) : sub_batch_size;
+            g_stat_total_scanned.fetch_add((unsigned long long)current_batch, std::memory_order_relaxed);
+
+            for (int i = 0; i < current_batch; i++) {
+                to_hex44(tag_buffer + i * 12, rs_ptr[(start + i) * 4]);
+            }
+
+            std::vector<int> candidate_indices;
+            bool bloom_ready = (bloom_ready_flag != nullptr) && bloom_ready_flag->load();
+            if (bloom_ready) {
+                // GPU Bloom prefilter: only probable hits go to Redis.
+                int bloom_threads = 256;
+                int bloom_blocks = (current_batch + bloom_threads - 1) / bloom_threads;
+                checkCuda(cudaMemcpy(dev_hex_buffer, tag_buffer, current_batch * 12, cudaMemcpyHostToDevice),
+                          "scanner bloom hex memcpy");
+                gpu_bloom_query_batch<<<bloom_blocks, bloom_threads>>>(
+                    dev_bloom_bits,
+                    bloom_num_bits,
+                    bloom_num_hashes,
+                    dev_hex_buffer,
+                    current_batch,
+                    12,
+                    dev_bloom_results);
+                checkCuda(cudaGetLastError(), "scanner bloom query launch");
+                checkCuda(cudaMemcpy(bloom_host_results, dev_bloom_results, current_batch * sizeof(uint8_t), cudaMemcpyDeviceToHost),
+                          "scanner bloom results memcpy");
+
+                candidate_indices.reserve(current_batch / 16 + 1);
+                for (int i = 0; i < current_batch; i++) {
+                    if (bloom_host_results[i] == 1) candidate_indices.push_back(i);
+                }
+            } else {
+                // Bloom not ready yet: fallback to Redis-only path to avoid false negatives.
+                candidate_indices.reserve(current_batch);
+                for (int i = 0; i < current_batch; i++) candidate_indices.push_back(i);
+            }
+
+            if (candidate_indices.empty()) {
+                g_stat_bloom_filtered.fetch_add((unsigned long long)current_batch, std::memory_order_relaxed);
+                continue;
+            }
+
+            if (candidate_indices.size() < (size_t)current_batch) {
+                g_stat_bloom_filtered.fetch_add((unsigned long long)(current_batch - (int)candidate_indices.size()), std::memory_order_relaxed);
+            }
+            g_stat_redis_queried.fetch_add((unsigned long long)candidate_indices.size(), std::memory_order_relaxed);
 
             std::vector<const char*> argv;
             std::vector<size_t> argvlen;
-            argv.reserve(current_batch + 2);
-            argvlen.reserve(current_batch + 2);
+            argv.reserve(candidate_indices.size() + 2);
+            argvlen.reserve(candidate_indices.size() + 2);
 
             argv.push_back("SMISMEMBER");
             argvlen.push_back(10);
             argv.push_back("mongo_keys");
             argvlen.push_back(10);
-
-            for (int i = 0; i < current_batch; i++) {
-                to_hex44(tag_buffer + i * 12, rs_ptr[(start + i) * 4]);
-                argv.push_back(tag_buffer + i * 12);
+            for (size_t i = 0; i < candidate_indices.size(); i++) {
+                int idx = candidate_indices[i];
+                argv.push_back(tag_buffer + idx * 12);
                 argvlen.push_back(11);
             }
 
@@ -760,16 +895,17 @@ public:
             if (reply->type == REDIS_REPLY_ARRAY) {
                 for (size_t j = 0; j < reply->elements; j++) {
                     if (reply->element[j]->integer == 1) {
+                        int original_idx = candidate_indices[j];
                         // Redis 命中！還原 k 值
                         uint64_t k_match[4];
-                        uint64_t carry = (uint64_t)(start + j);
+                        uint64_t carry = (uint64_t)(start + original_idx);
                         for (int limb = 0; limb < 4; limb++) {
                             k_match[limb] = k_start[limb] + carry;
                             carry = (k_match[limb] < k_start[limb]) ? 1 : 0;
                         }
 
                         std::string ks = hex256(k_match);
-                        std::string rs = hex256(rs_ptr + (start + j) * 4);
+                        std::string rs = hex256(rs_ptr + (start + original_idx) * 4);
 
                         // 丟入背景佇列處理 MongoDB
                         MatchData mdata;
@@ -878,6 +1014,170 @@ int main(int argc, char **argv) {
     // 多執行緒 Redis Worker 池 (增加到 16 個 Worker)
     // -----------------------------------------------------------------------
     const int num_workers = 16;
+
+    // -----------------------------------------------------------------------
+    // GPU Bloom Filter 初始化 (15 billion keys @ 3% FPR)
+    // -----------------------------------------------------------------------
+    uint64_t expected_mongo_keys = 1500000000ULL;   // 1.5 billion keys
+    double fpr = 0.03;                              // 3% false positive rate
+    const size_t bloom_budget_mb = 1536;            // VRAM budget for Bloom bits
+    
+    // 計算最優 bit 數：m = -n*ln(p) / (ln(2)^2)
+    uint64_t ideal_bits = (uint64_t)(-(double)expected_mongo_keys * log(fpr) / (log(2) * log(2)));
+    uint64_t budget_bits = (uint64_t)bloom_budget_mb * 1024ULL * 1024ULL * 8ULL;
+    uint64_t bloom_num_bits = (ideal_bits > budget_bits) ? budget_bits : ideal_bits;
+    
+    // 計算最優 hash 函數數：k = (m/n) * ln(2)
+    int bloom_num_hashes = (int)llround((double)bloom_num_bits / expected_mongo_keys * log(2));
+    if (bloom_num_hashes < 1) bloom_num_hashes = 1;
+    if (bloom_num_hashes > 10) bloom_num_hashes = 10;
+    
+        printf("[Bloom Filter] 初始化: %llu bits (%.2f MB), %d hash functions\n",
+            (unsigned long long)bloom_num_bits,
+            (double)bloom_num_bits / 8.0 / 1024.0 / 1024.0,
+            bloom_num_hashes);
+        if (ideal_bits > budget_bits) {
+         printf("[Bloom Filter] 已套用 %zu MB 顯存上限（理想需求 %.2f MB）\n",
+             bloom_budget_mb,
+             (double)ideal_bits / 8.0 / 1024.0 / 1024.0);
+        }
+    
+    // 分配 GPU 記憶體用於 Bloom Filter
+    size_t bloom_array_size = (bloom_num_bits + 63) / 64;
+    uint64_t *dev_bloom_bits = nullptr;
+    checkCuda(cudaMalloc(&dev_bloom_bits, bloom_array_size * sizeof(uint64_t)), "Bloom malloc");
+    checkCuda(cudaMemset(dev_bloom_bits, 0, bloom_array_size * sizeof(uint64_t)), "Bloom memset");
+    
+    printf("[Bloom Filter] 共分配 %.2f MB 的 GPU 記憶體\n",
+           (double)bloom_array_size * sizeof(uint64_t) / 1024.0 / 1024.0);
+    
+    // 啟動 Bloom Filter 加載線程（從 Redis 流式讀取）
+    std::atomic<bool> bloom_loader_done(false);
+    std::atomic<bool> bloom_filter_ready(false);
+    std::atomic<uint64_t> bloom_loaded_count(0);
+    
+    std::thread bloom_loader([&]() {
+        redisContext *rc = redisConnect("127.0.0.1", 6379);
+        if (rc == nullptr || rc->err) {
+            fprintf(stderr, "[Bloom Loader] Redis連線失敗: %s\n", (rc && rc->errstr) ? rc->errstr : "unknown");
+            if (rc) redisFree(rc);
+            bloom_loader_done = true;
+            return;
+        }
+
+        timeval redis_timeout;
+        redis_timeout.tv_sec = 30;
+        redis_timeout.tv_usec = 0;
+        redisSetTimeout(rc, redis_timeout);
+
+        printf("[Bloom Loader] 開始從 Redis SSCAN 載入 Bloom bits...\n");
+        
+        uint64_t cursor = 0;
+        const uint64_t batch_size = 1000000;   // 每批 1M keys，降低 Redis 壓力
+        size_t loader_capacity = (size_t)batch_size;
+        char *batch_hex = new char[loader_capacity * 11];
+        char *dev_loader_hex_buffer = nullptr;
+        checkCuda(cudaMalloc(&dev_loader_hex_buffer, loader_capacity * 11), "Bloom loader hex malloc");
+        cudaStream_t bloom_stream;
+        checkCuda(cudaStreamCreate(&bloom_stream), "Bloom loader stream create");
+        bool load_ok = true;
+        int consecutive_errors = 0;
+        
+        do {
+            char cmd[256];
+            snprintf(cmd, sizeof(cmd), "SSCAN mongo_keys %llu COUNT %llu",
+                     (unsigned long long)cursor,
+                     (unsigned long long)batch_size);
+            redisReply *reply = (redisReply *)redisCommand(rc, cmd);
+            
+            if (reply == nullptr || reply->type != REDIS_REPLY_ARRAY || reply->elements != 2) {
+                consecutive_errors++;
+                fprintf(stderr, "[Bloom Loader] SSCAN 失敗 (retry=%d): %s\n", consecutive_errors,
+                        rc->errstr ? rc->errstr : "unexpected reply");
+                if (reply) freeReplyObject(reply);
+                if (consecutive_errors >= 5) {
+                    load_ok = false;
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(200 * consecutive_errors));
+                continue;
+            }
+            consecutive_errors = 0;
+            
+            // 提取 cursor
+            redisReply *cursor_reply = reply->element[0];
+            if (cursor_reply->type == REDIS_REPLY_STRING) {
+                cursor = strtoull(cursor_reply->str, nullptr, 10);
+            }
+            
+            // 提取 keys 並加載到 GPU Bloom Filter
+            redisReply *keys_reply = reply->element[1];
+            if (keys_reply->type == REDIS_REPLY_ARRAY) {
+                if (keys_reply->elements > loader_capacity) {
+                    size_t new_capacity = keys_reply->elements;
+                    delete[] batch_hex;
+                    batch_hex = new char[new_capacity * 11];
+                    if (dev_loader_hex_buffer) cudaFree(dev_loader_hex_buffer);
+                    checkCuda(cudaMalloc(&dev_loader_hex_buffer, new_capacity * 11), "Bloom loader hex realloc");
+                    loader_capacity = new_capacity;
+                    printf("\n[Bloom Loader] 緩衝區擴容至 %zu keys\n", loader_capacity);
+                }
+
+                size_t valid_count = 0;
+                for (size_t i = 0; i < keys_reply->elements; i++) {
+                    const char *key = keys_reply->element[i]->str;
+                    if (key != nullptr && strlen(key) >= 11) {
+                        memcpy(batch_hex + valid_count * 11, key, 11);
+                        valid_count++;
+                    }
+                }
+                
+                if (valid_count > 0) {
+                    size_t copy_size = valid_count * 11;
+                    checkCuda(cudaMemcpyAsync(dev_loader_hex_buffer, batch_hex, copy_size, cudaMemcpyHostToDevice, bloom_stream),
+                             "Bloom loader memcpy");
+                    
+                    int threads = 256;
+                    int blocks = ((int)valid_count + threads - 1) / threads;
+                    gpu_bloom_add_batch<<<blocks, threads, 0, bloom_stream>>>(dev_bloom_bits, bloom_num_bits, bloom_num_hashes,
+                                                                               dev_loader_hex_buffer, (int)valid_count, 11);
+                    
+                    checkCuda(cudaStreamSynchronize(bloom_stream), "Bloom add batch");
+                    bloom_loaded_count += valid_count;
+                    
+                          printf("[Bloom Loader] \r已加載 %llu 個 keys...",
+                              (unsigned long long)bloom_loaded_count.load());
+                    fflush(stdout);
+                }
+            }
+            
+            freeReplyObject(reply);
+            
+        } while (cursor != 0);
+        
+        if (dev_loader_hex_buffer) cudaFree(dev_loader_hex_buffer);
+        cudaStreamDestroy(bloom_stream);
+        delete[] batch_hex;
+        redisFree(rc);
+        bloom_filter_ready = (load_ok && cursor == 0);
+        bloom_loader_done = true;
+        if (bloom_filter_ready.load()) {
+            printf("\n[Bloom Loader] 完成！已加載 %llu 個 keys，Bloom 已啟用\n",
+                   (unsigned long long)bloom_loaded_count.load());
+        } else {
+            printf("\n[Bloom Loader] 未完成（已加載 %llu 個 keys），維持 Redis 全量校驗\n",
+                   (unsigned long long)bloom_loaded_count.load());
+        }
+    });
+    printf("[Bloom Loader] 等待 Bloom 載入完成後再啟動主流程...\n");
+    bloom_loader.join();
+    if (!bloom_filter_ready.load()) {
+        fprintf(stderr, "[Bloom Loader] 初始化失敗，終止主流程以避免漏檢。\n");
+        mongoc_cleanup();
+        return 1;
+    }
+    printf("[Bloom Loader] 已完成，開始主流程。\n");
+    
     SafeQueue<BatchTask> task_queue;
     SafeQueue<int> free_indices;
     for (int i = 0; i < num_streams; i++) free_indices.push(i);
@@ -886,8 +1186,8 @@ int main(int argc, char **argv) {
 
     std::vector<std::thread> workers;
     for (int i = 0; i < num_workers; i++) {
-        workers.emplace_back([&task_queue, &free_indices, streams]() {
-            HybridScanner scanner("127.0.0.1", 6379);
+        workers.emplace_back([&task_queue, &free_indices, streams, dev_bloom_bits, bloom_num_bits, bloom_num_hashes, &bloom_filter_ready]() {
+            HybridScanner scanner("127.0.0.1", 6379, dev_bloom_bits, bloom_num_bits, bloom_num_hashes, &bloom_filter_ready);
             while (true) {
                 BatchTask task = task_queue.pop();
                 if (task.n == -1) break; // Sentinel to exit
@@ -907,6 +1207,39 @@ int main(int argc, char **argv) {
 
     std::atomic<long long> total_keys(0);
     auto start_time = std::chrono::high_resolution_clock::now();
+
+    std::atomic<bool> stats_stop(false);
+    std::thread stats_reporter([&]() {
+        while (!stats_stop.load(std::memory_order_relaxed)) {
+            std::this_thread::sleep_for(std::chrono::seconds(10));
+            if (stats_stop.load(std::memory_order_relaxed)) break;
+
+            unsigned long long total_scanned = g_stat_total_scanned.load(std::memory_order_relaxed);
+            unsigned long long bloom_filtered = g_stat_bloom_filtered.load(std::memory_order_relaxed);
+            unsigned long long redis_queried = g_stat_redis_queried.load(std::memory_order_relaxed);
+            bool bloom_ready = bloom_filter_ready.load(std::memory_order_relaxed);
+            bool loader_done = bloom_loader_done.load(std::memory_order_relaxed);
+            unsigned long long loaded = (unsigned long long)bloom_loaded_count.load(std::memory_order_relaxed);
+
+            double bloom_filtered_pct = (total_scanned > 0)
+                ? (100.0 * (double)bloom_filtered / (double)total_scanned)
+                : 0.0;
+            double redis_queried_pct = (total_scanned > 0)
+                ? (100.0 * (double)redis_queried / (double)total_scanned)
+                : 0.0;
+
+                     printf("\n[STATS] scanned=%llu | bloom_filtered=%llu (%.2f%%) | redis_queried=%llu (%.2f%%) | loader_done=%d | bloom_ready=%d | loaded=%llu\n",
+                   total_scanned,
+                   bloom_filtered,
+                   bloom_filtered_pct,
+                   redis_queried,
+                         redis_queried_pct,
+                         loader_done ? 1 : 0,
+                         bloom_ready ? 1 : 0,
+                         loaded);
+            fflush(stdout);
+        }
+    });
 
     do {
         // 從空閒索引隊列取出一個 Buffer
@@ -963,6 +1296,9 @@ int main(int argc, char **argv) {
         task_queue.push(sentinel);
     }
     for (auto &t : workers) t.join();
+
+    stats_stop.store(true, std::memory_order_relaxed);
+    if (stats_reporter.joinable()) stats_reporter.join();
 
     // Shutdown mongo logger
     MatchData m_sentinel;
