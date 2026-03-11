@@ -19,7 +19,7 @@
  *   最多只需 (n_keys/BATCH) 次 Batch Inverse，效率極高。
  *
  * 編譯 (在 /workspace 目錄下)：
- *   nvcc -O2 -arch=sm_86 -I. CalcR_GPU.cu -o CalcR_GPU -lhiredis $(pkg-config --cflags --libs libmongoc-1.0)
+ *   nvcc -O2 -arch=sm_86 -I. CalcR_GPU.cu -o CalcR_GPU $(pkg-config --cflags --libs libmongoc-1.0)
  *   (sm_86 = RTX 3xxx/Ada；依卡型調整)
  *
  * 執行：
@@ -41,7 +41,10 @@
 #include <condition_variable>
 #include <queue>
 #include <atomic>
-#include <hiredis/hiredis.h>
+#include <memory>
+#include <chrono>
+#include <algorithm>
+#include <fstream>
 #include <mongoc/mongoc.h>
 #include <bson/bson.h>
 #include <ctime>
@@ -549,29 +552,191 @@ static void to_hex256(char *dest, const uint64_t v[4]) {
     dest[64] = '\0';
 }
 
-static void to_hex44(char *dest, uint64_t v0) {
-    uint64_t val = v0 & 0xFFFFFFFFFFFULL;
-    for (int j = 10; j >= 0; j--) {
-        dest[j] = HEX_CHARS[val & 0xf];
-        val >>= 4;
-    }
-    dest[11] = '\0';
-}
-
 static std::string hex256(const uint64_t v[4]) {
     char buf[65];
     to_hex256(buf, v);
     return std::string(buf);
 }
 
+static bool parse_hex44(uint64_t *out, const char *s) {
+    if (!out || !s) return false;
+
+    uint64_t value = 0;
+    int digits = 0;
+    while (*s && digits < 11) {
+        char c = *s++;
+        uint64_t nibble = 0;
+        if (c >= '0' && c <= '9') nibble = (uint64_t)(c - '0');
+        else if (c >= 'a' && c <= 'f') nibble = (uint64_t)(c - 'a' + 10);
+        else if (c >= 'A' && c <= 'F') nibble = (uint64_t)(c - 'A' + 10);
+        else return false;
+        value = (value << 4) | nibble;
+        digits++;
+    }
+
+    if (digits != 11 || *s != '\0') return false;
+    *out = value;
+    return true;
+}
+
+class MongoKeyCache {
+public:
+    bool loadFromFile(const char *file_path) {
+        if (!file_path || file_path[0] == '\0') return false;
+
+        std::ifstream in(file_path, std::ios::binary);
+        if (!in.is_open()) {
+            return false;
+        }
+
+        char magic[8] = {0};
+        uint64_t version = 0;
+        uint64_t count = 0;
+        in.read(magic, sizeof(magic));
+        in.read(reinterpret_cast<char*>(&version), sizeof(version));
+        in.read(reinterpret_cast<char*>(&count), sizeof(count));
+        if (!in.good()) {
+            return false;
+        }
+
+        const char expected_magic[8] = {'M','K','E','Y','S','C','A','1'};
+        if (memcmp(magic, expected_magic, sizeof(magic)) != 0 || version != 1) {
+            return false;
+        }
+
+        values.resize((size_t)count);
+        if (count > 0) {
+            in.read(reinterpret_cast<char*>(values.data()), (std::streamsize)(count * sizeof(uint64_t)));
+            if (!in.good()) {
+                values.clear();
+                return false;
+            }
+        }
+
+        if (!std::is_sorted(values.begin(), values.end())) {
+            std::sort(values.begin(), values.end());
+            values.erase(std::unique(values.begin(), values.end()), values.end());
+        }
+
+        printf("Loaded %zu mongo_keys from cache file: %s\n", values.size(), file_path);
+        return !values.empty();
+    }
+
+    bool saveToFile(const char *file_path) const {
+        if (!file_path || file_path[0] == '\0' || values.empty()) return false;
+
+        std::ofstream out(file_path, std::ios::binary | std::ios::trunc);
+        if (!out.is_open()) {
+            return false;
+        }
+
+        const char magic[8] = {'M','K','E','Y','S','C','A','1'};
+        const uint64_t version = 1;
+        const uint64_t count = (uint64_t)values.size();
+        out.write(magic, sizeof(magic));
+        out.write(reinterpret_cast<const char*>(&version), sizeof(version));
+        out.write(reinterpret_cast<const char*>(&count), sizeof(count));
+        out.write(reinterpret_cast<const char*>(values.data()), (std::streamsize)(count * sizeof(uint64_t)));
+        if (!out.good()) {
+            return false;
+        }
+
+        printf("Saved %zu mongo_keys to cache file: %s\n", values.size(), file_path);
+        return true;
+    }
+
+    bool loadFromMongo(const char *mongo_uri, const char *db_name, const char *collection_name) {
+        mongoc_client_t *client = mongoc_client_new(mongo_uri);
+        if (!client) {
+            fprintf(stderr, "MongoKeyCache: failed to parse MongoDB URI\n");
+            return false;
+        }
+
+        mongoc_collection_t *col = mongoc_client_get_collection(client, db_name, collection_name);
+        bson_t *query = bson_new();
+        bson_t *opts = bson_new();
+        BSON_APPEND_INT32(opts, "batchSize", 200000);
+
+        mongoc_cursor_t *cursor = mongoc_collection_find_with_opts(col, query, opts, nullptr);
+        const bson_t *doc = nullptr;
+
+        values.clear();
+        printf("Loading mongo_keys from MongoDB into local cache...\n");
+        while (mongoc_cursor_next(cursor, &doc)) {
+            bson_iter_t it;
+            const char *tag_str = nullptr;
+            uint32_t tag_len = 0;
+
+            if (bson_iter_init_find(&it, doc, "_id") && BSON_ITER_HOLDS_UTF8(&it)) {
+                tag_str = bson_iter_utf8(&it, &tag_len);
+            } else if (bson_iter_init_find(&it, doc, "tag") && BSON_ITER_HOLDS_UTF8(&it)) {
+                tag_str = bson_iter_utf8(&it, &tag_len);
+            }
+
+            if (!tag_str || tag_len == 0) continue;
+
+            std::string s(tag_str, tag_len);
+            uint64_t tag = 0;
+            if (parse_hex44(&tag, s.c_str())) {
+                values.push_back(tag);
+            }
+        }
+
+        if (mongoc_cursor_error(cursor, nullptr)) {
+            fprintf(stderr, "MongoKeyCache: cursor error while loading mongo_keys\n");
+            values.clear();
+        }
+
+        mongoc_cursor_destroy(cursor);
+        bson_destroy(opts);
+        bson_destroy(query);
+        mongoc_collection_destroy(col);
+        mongoc_client_destroy(client);
+
+        std::sort(values.begin(), values.end());
+        values.erase(std::unique(values.begin(), values.end()), values.end());
+        printf("\rLoaded %zu mongo_keys into local cache\n", values.size());
+        return !values.empty();
+    }
+
+    bool contains(uint64_t value) const {
+        return std::binary_search(values.begin(), values.end(), value);
+    }
+
+    size_t containsBatch(const uint64_t *tags, uint8_t *hits, size_t n) const {
+        if (!tags || !hits || n == 0 || values.empty()) return 0;
+
+        size_t matched = 0;
+        for (size_t i = 0; i < n; i++) {
+            hits[i] = contains(tags[i]) ? 1 : 0;
+            matched += hits[i] ? 1 : 0;
+        }
+        return matched;
+    }
+
+    bool empty() const {
+        return values.empty();
+    }
+
+private:
+    std::vector<uint64_t> values;
+};
+
 // ===========================================================================
 // Thread-Safe Task Queue for Pipelining
 // ===========================================================================
-struct BatchTask {
+struct PendingBatch {
     int stream_idx;
     uint64_t k_start[4];
-    uint64_t* r_ptr;
     int n;
+    bool exit_signal = false;
+};
+
+struct ScanTask {
+    uint64_t k_start[4];
+    std::shared_ptr<uint64_t> r_values;
+    int n;
+    bool exit_signal = false;
 };
 
 template <typename T>
@@ -583,13 +748,13 @@ private:
 public:
     void push(T val) {
         std::lock_guard<std::mutex> lock(m);
-        q.push(val);
+        q.push(std::move(val));
         cv.notify_one();
     }
     T pop() {
         std::unique_lock<std::mutex> lock(m);
         cv.wait(lock, [this]{ return !q.empty(); });
-        T val = q.front();
+        T val = std::move(q.front());
         q.pop();
         return val;
     }
@@ -607,7 +772,7 @@ struct MatchData {
 
 SafeQueue<MatchData> g_match_queue;
 
-void MongoMatchLogger(const char* mongo_uri, const char* redis_ip, int redis_port) {
+void MongoMatchLogger(const char* mongo_uri) {
     mongoc_client_t *client = mongoc_client_new(mongo_uri);
     if (!client) {
         fprintf(stderr, "MatchLogger: Failed to parse MongoDB URI\n");
@@ -615,17 +780,7 @@ void MongoMatchLogger(const char* mongo_uri, const char* redis_ip, int redis_por
     }
     mongoc_collection_t *match_col = mongoc_client_get_collection(client, "ecdsa", "match");
     mongoc_collection_t *btc_col = mongoc_client_get_collection(client, "ecdsa", "btc");
-
-    // Connect to Redis for managing the matched keys set
-    redisContext *redis_ctx = redisConnect(redis_ip, redis_port);
-    if (redis_ctx == nullptr || redis_ctx->err) {
-        fprintf(stderr, "MatchLogger: Redis Connection Error\n");
-        if (redis_ctx) redisFree(redis_ctx);
-        // Continue without Redis if it fails, or you could exit. We will continue and just skip Redis ops.
-    } else {
-        redisReply *reply = (redisReply *)redisCommand(redis_ctx, "SELECT 0");
-        if (reply) freeReplyObject(reply);
-    }
+    mongoc_collection_t *candidate_col = mongoc_client_get_collection(client, "ecdsa", "matched_candidates");
 
     while (true) {
         MatchData data = g_match_queue.pop();
@@ -633,13 +788,31 @@ void MongoMatchLogger(const char* mongo_uri, const char* redis_ip, int redis_por
 
         std::string ks = data.k;
         std::string rs = data.r;
-        std::string redis_val = rs + ":" + ks;
 
-        // 1. Write the found match (r:k) into Redis Set
-        if (redis_ctx && !redis_ctx->err) {
-            redisReply *reply = (redisReply *)redisCommand(redis_ctx, "SADD matched_candidates %s", redis_val.c_str());
-            if (reply) freeReplyObject(reply);
+        // 1. Upsert candidate into MongoDB matched_candidates collection.
+        bson_t filter;
+        bson_t update;
+        bson_t opts;
+        bson_error_t error;
+        bson_init(&filter);
+        BSON_APPEND_UTF8(&filter, "r", rs.c_str());
+        BSON_APPEND_UTF8(&filter, "k", ks.c_str());
+
+        bson_init(&update);
+        bson_t set_doc;
+        BSON_APPEND_DOCUMENT_BEGIN(&update, "$set", &set_doc);
+        BSON_APPEND_UTF8(&set_doc, "status", "candidate");
+        BSON_APPEND_TIME_T(&set_doc, "updated_at", time(NULL));
+        bson_append_document_end(&update, &set_doc);
+
+        bson_init(&opts);
+        BSON_APPEND_BOOL(&opts, "upsert", true);
+        if (!mongoc_collection_update_one(candidate_col, &filter, &update, &opts, nullptr, &error)) {
+            fprintf(stderr, "MongoDB Candidate Upsert Error: %s\n", error.message);
         }
+        bson_destroy(&opts);
+        bson_destroy(&update);
+        bson_destroy(&filter);
 
         // 2. Query MongoDB btc collection
         std::string r0 = "0" + rs;
@@ -662,6 +835,24 @@ void MongoMatchLogger(const char* mongo_uri, const char* redis_ip, int redis_por
         bool is_precise_match = mongoc_cursor_next(cursor, &found_btc_doc);
         
         if (is_precise_match) {
+            bson_t c_filter;
+            bson_t c_update;
+            bson_init(&c_filter);
+            BSON_APPEND_UTF8(&c_filter, "r", rs.c_str());
+            BSON_APPEND_UTF8(&c_filter, "k", ks.c_str());
+            bson_init(&c_update);
+            bson_t c_set_doc;
+            BSON_APPEND_DOCUMENT_BEGIN(&c_update, "$set", &c_set_doc);
+            BSON_APPEND_UTF8(&c_set_doc, "status", "precise");
+            BSON_APPEND_BOOL(&c_set_doc, "found", true);
+            BSON_APPEND_TIME_T(&c_set_doc, "updated_at", time(NULL));
+            bson_append_document_end(&c_update, &c_set_doc);
+            if (!mongoc_collection_update_one(candidate_col, &c_filter, &c_update, nullptr, nullptr, &error)) {
+                fprintf(stderr, "MongoDB Candidate Finalize Error: %s\n", error.message);
+            }
+            bson_destroy(&c_update);
+            bson_destroy(&c_filter);
+
             // Precise match found! Write to MongoDB match collection.
             bson_t *doc = bson_new();
             BSON_APPEND_UTF8(doc, "r", rs.c_str());
@@ -669,7 +860,6 @@ void MongoMatchLogger(const char* mongo_uri, const char* redis_ip, int redis_por
             BSON_APPEND_UTF8(doc, "found", "y");
             BSON_APPEND_TIME_T(doc, "time", time(NULL));
             
-            bson_error_t error;
             if (!mongoc_collection_insert_one(match_col, doc, NULL, NULL, &error)) {
                 fprintf(stderr, "MongoDB Insert Error: %s\n", error.message);
             }
@@ -677,109 +867,67 @@ void MongoMatchLogger(const char* mongo_uri, const char* redis_ip, int redis_por
             
             printf("               [PRECISE MATCH FOUND IN BG!] Inserted into match col for r=%s\n", rs.c_str());
         } else {
-            // Not a precise match. Remove from Redis Set.
-            if (redis_ctx && !redis_ctx->err) {
-                redisReply *reply = (redisReply *)redisCommand(redis_ctx, "SREM matched_candidates %s", redis_val.c_str());
-                if (reply) freeReplyObject(reply);
+            // Not a precise match. Remove from matched_candidates collection.
+            bson_t c_filter;
+            bson_init(&c_filter);
+            BSON_APPEND_UTF8(&c_filter, "r", rs.c_str());
+            BSON_APPEND_UTF8(&c_filter, "k", ks.c_str());
+            if (!mongoc_collection_delete_one(candidate_col, &c_filter, nullptr, nullptr, &error)) {
+                fprintf(stderr, "MongoDB Candidate Delete Error: %s\n", error.message);
             }
+            bson_destroy(&c_filter);
         }
         
         mongoc_cursor_destroy(cursor);
         bson_destroy(query);
     }
 
-    if (redis_ctx) redisFree(redis_ctx);
+    mongoc_collection_destroy(candidate_col);
     mongoc_collection_destroy(match_col);
     mongoc_collection_destroy(btc_col);
     mongoc_client_destroy(client);
 }
 
 // ===========================================================================
-// Hybrid Scanner Logic (Redis + MongoDB)
+// Hybrid Scanner Logic (Local Cache + MongoDB)
 // ===========================================================================
 class HybridScanner {
 public:
-    redisContext *redis_ctx = nullptr;
-    char* tag_buffer = nullptr;
-    int current_n = 0;
+    const MongoKeyCache *local_cache = nullptr;
+    std::vector<uint64_t> local_tags;
+    std::vector<uint8_t> local_hits;
 
-    HybridScanner(const char *redis_ip, int redis_port) {
-        // Connect to Redis
-        redis_ctx = redisConnect(redis_ip, redis_port);
-        if (redis_ctx == nullptr || redis_ctx->err) {
-            if (redis_ctx) printf("Redis Connection Error: %s\n", redis_ctx->errstr);
-            else printf("Redis Connection Error: Can't allocate redis context\n");
-            exit(1);
-        }
-        redisReply *reply = (redisReply *)redisCommand(redis_ctx, "SELECT 0");
-        freeReplyObject(reply);
+    HybridScanner(const MongoKeyCache *cache) {
+        local_cache = cache;
     }
 
-    ~HybridScanner() {
-        if (redis_ctx) redisFree(redis_ctx);
-        if (tag_buffer) delete[] tag_buffer;
-    }
+    ~HybridScanner() {}
 
     void checkMatchBatch(const uint64_t k_start[4], const uint64_t *rs_ptr, int n) {
-        if (n <= 0) return;
+        if (n <= 0 || !local_cache || local_cache->empty()) return;
 
-        const int sub_batch_size = 50000;
-        
-        if (sub_batch_size > current_n) {
-            if (tag_buffer) delete[] tag_buffer;
-            tag_buffer = new char[sub_batch_size * 12];
-            current_n = sub_batch_size;
+        if ((int)local_tags.size() < n) local_tags.resize((size_t)n);
+        if ((int)local_hits.size() < n) local_hits.resize((size_t)n);
+
+        for (int i = 0; i < n; i++) {
+            local_tags[(size_t)i] = rs_ptr[i * 4] & 0xFFFFFFFFFFFULL;
         }
+        local_cache->containsBatch(local_tags.data(), local_hits.data(), (size_t)n);
 
-        for (int start = 0; start < n; start += sub_batch_size) {
-            int current_batch = (n - start < sub_batch_size) ? (n - start) : sub_batch_size;
+        for (int i = 0; i < n; i++) {
+            if (!local_hits[(size_t)i]) continue;
 
-            std::vector<const char*> argv;
-            std::vector<size_t> argvlen;
-            argv.reserve(current_batch + 2);
-            argvlen.reserve(current_batch + 2);
-
-            argv.push_back("SMISMEMBER");
-            argvlen.push_back(10);
-            argv.push_back("mongo_keys");
-            argvlen.push_back(10);
-
-            for (int i = 0; i < current_batch; i++) {
-                to_hex44(tag_buffer + i * 12, rs_ptr[(start + i) * 4]);
-                argv.push_back(tag_buffer + i * 12);
-                argvlen.push_back(11);
+            uint64_t k_match[4];
+            uint64_t carry = (uint64_t)i;
+            for (int limb = 0; limb < 4; limb++) {
+                k_match[limb] = k_start[limb] + carry;
+                carry = (k_match[limb] < k_start[limb]) ? 1 : 0;
             }
 
-            redisReply *reply = (redisReply *)redisCommandArgv(redis_ctx, argv.size(), argv.data(), argvlen.data());
-            
-            if (reply == nullptr) {
-                fprintf(stderr, "Redis error: %s\n", redis_ctx->errstr);
-                continue;
-            }
-
-            if (reply->type == REDIS_REPLY_ARRAY) {
-                for (size_t j = 0; j < reply->elements; j++) {
-                    if (reply->element[j]->integer == 1) {
-                        // Redis 命中！還原 k 值
-                        uint64_t k_match[4];
-                        uint64_t carry = (uint64_t)(start + j);
-                        for (int limb = 0; limb < 4; limb++) {
-                            k_match[limb] = k_start[limb] + carry;
-                            carry = (k_match[limb] < k_start[limb]) ? 1 : 0;
-                        }
-
-                        std::string ks = hex256(k_match);
-                        std::string rs = hex256(rs_ptr + (start + j) * 4);
-
-                        // 丟入背景佇列處理 MongoDB
-                        MatchData mdata;
-                        mdata.k = ks;
-                        mdata.r = rs;
-                        g_match_queue.push(mdata);
-                    }
-                }
-            }
-            freeReplyObject(reply);
+            MatchData mdata;
+            mdata.k = hex256(k_match);
+            mdata.r = hex256(rs_ptr + i * 4);
+            g_match_queue.push(std::move(mdata));
         }
     }
 };
@@ -848,54 +996,115 @@ int main(int argc, char **argv) {
     // Initialize MongoDB Driver (Global)
     mongoc_init();
 
+    MongoKeyCache mongo_key_cache;
+    const char *cache_file_env = getenv("MONGO_KEYS_CACHE_FILE");
+    const char *cache_file = (cache_file_env && cache_file_env[0]) ? cache_file_env : "mongo_keys.cache.bin";
+
+    bool local_cache_ready = mongo_key_cache.loadFromFile(cache_file);
+    if (!local_cache_ready) {
+        local_cache_ready = mongo_key_cache.loadFromMongo("mongodb://127.0.0.1:27017", "ecdsa", "mongo_keys");
+        if (local_cache_ready) {
+            if (!mongo_key_cache.saveToFile(cache_file)) {
+                fprintf(stderr, "Warning: failed to save local cache file: %s\n", cache_file);
+            }
+        }
+    }
+
+    if (!local_cache_ready) {
+        fprintf(stderr, "Failed to load local cache from file and MongoDB (ecdsa.mongo_keys).\n");
+        return 1;
+    }
+
     checkCuda(cudaMemcpyToSymbol(DEV_P,  HOST_P,  32), "cpyP");
     checkCuda(cudaMemcpyToSymbol(DEV_N,  HOST_N,  32), "cpyN");
     checkCuda(cudaMemcpyToSymbol(DEV_GX, HOST_GX, 32), "cpyGx");
     checkCuda(cudaMemcpyToSymbol(DEV_GY, HOST_GY, 32), "cpyGy");
 
     // -----------------------------------------------------------------------
-    // 分配 Ring Buffer 與 CUDA Streams (增加到 32 個以對抗 Redis 延遲)
+    // 分配 Ring Buffer 與 CUDA Streams
     // -----------------------------------------------------------------------
     const int num_streams = 32;
     cudaStream_t streams[num_streams];
+    cudaEvent_t copy_done_events[num_streams];
     uint64_t *d_X[num_streams], *d_Y[num_streams], *d_Z[num_streams], *d_r[num_streams];
-    uint64_t *h_r[num_streams], *h_k[num_streams];
+    uint64_t *h_r[num_streams];
 
     size_t X_bytes = (size_t)n * 4 * sizeof(uint64_t);
     size_t Z_bytes = (size_t)n * 5 * sizeof(uint64_t);
 
     for (int i = 0; i < num_streams; i++) {
         checkCuda(cudaStreamCreate(&streams[i]), "stream create");
+        checkCuda(cudaEventCreateWithFlags(&copy_done_events[i], cudaEventDisableTiming), "event create");
         checkCuda(cudaMalloc(&d_X[i], X_bytes), "malloc X");
         checkCuda(cudaMalloc(&d_Y[i], X_bytes), "malloc Y");
         checkCuda(cudaMalloc(&d_Z[i], Z_bytes), "malloc Z");
         checkCuda(cudaMalloc(&d_r[i], X_bytes), "malloc r");
         checkCuda(cudaHostAlloc(&h_r[i], X_bytes, cudaHostAllocPortable), "hostAlloc r");
-        checkCuda(cudaHostAlloc(&h_k[i], X_bytes, cudaHostAllocPortable), "hostAlloc k");
     }
 
     // -----------------------------------------------------------------------
-    // 多執行緒 Redis Worker 池 (增加到 16 個 Worker)
+    // 多執行緒掃描 Worker 池
+    // 預設使用較保守的核心數，避免把 CPU 壓滿。
+    // 可用 SCAN_WORKERS 覆蓋，例如：SCAN_WORKERS=4 ./CalcR_GPU 0
     // -----------------------------------------------------------------------
-    const int num_workers = 16;
-    SafeQueue<BatchTask> task_queue;
+    unsigned int hw = std::thread::hardware_concurrency();
+    if (hw == 0) hw = 8;
+    int num_workers = (int)std::max(1u, hw / 2);
+    if (num_workers > 8) num_workers = 8;
+
+    const char *workers_env = getenv("SCAN_WORKERS");
+    if (workers_env && workers_env[0] != '\0') {
+        int requested = atoi(workers_env);
+        if (requested > 0) num_workers = requested;
+    }
+    SafeQueue<PendingBatch> completion_queue;
+    SafeQueue<ScanTask> scan_queue;
     SafeQueue<int> free_indices;
     for (int i = 0; i < num_streams; i++) free_indices.push(i);
 
-    std::thread mongo_logger(MongoMatchLogger, "mongodb://127.0.0.1:27017", "127.0.0.1", 6379);
+    // Backpressure: cap pending scan batches to prevent unbounded RAM growth.
+    // Approx memory per pending scan batch = X_bytes.
+    int max_pending_scan = (int)((1024ULL * 1024ULL * 1024ULL) / X_bytes); // target ~1GB queue footprint
+    if (max_pending_scan < 2) max_pending_scan = 2;
+    if (max_pending_scan > 128) max_pending_scan = 128;
+
+    const char *pending_env = getenv("MAX_PENDING_SCAN");
+    if (pending_env && pending_env[0] != '\0') {
+        int requested = atoi(pending_env);
+        if (requested >= 1) max_pending_scan = requested;
+    }
+
+    std::thread mongo_logger(MongoMatchLogger, "mongodb://127.0.0.1:27017");
+
+    std::thread completion_worker([&completion_queue, &scan_queue, &free_indices, h_r, copy_done_events, X_bytes]() {
+        while (true) {
+            PendingBatch batch = completion_queue.pop();
+            if (batch.exit_signal) break;
+
+            checkCuda(cudaEventSynchronize(copy_done_events[batch.stream_idx]), "wait for copy completion");
+
+            std::shared_ptr<uint64_t> result_copy(new uint64_t[(size_t)batch.n * 4], std::default_delete<uint64_t[]>());
+            memcpy(result_copy.get(), h_r[batch.stream_idx], X_bytes);
+
+            free_indices.push(batch.stream_idx);
+
+            ScanTask scan_task;
+            memcpy(scan_task.k_start, batch.k_start, sizeof(scan_task.k_start));
+            scan_task.r_values = std::move(result_copy);
+            scan_task.n = batch.n;
+            scan_queue.push(std::move(scan_task));
+        }
+    });
 
     std::vector<std::thread> workers;
     for (int i = 0; i < num_workers; i++) {
-        workers.emplace_back([&task_queue, &free_indices, streams]() {
-            HybridScanner scanner("127.0.0.1", 6379);
+        workers.emplace_back([&scan_queue, &mongo_key_cache]() {
+            HybridScanner scanner(&mongo_key_cache);
             while (true) {
-                BatchTask task = task_queue.pop();
-                if (task.n == -1) break; // Sentinel to exit
-                
-                checkCuda(cudaStreamSynchronize(streams[task.stream_idx]), "sync in worker");
-                
-                scanner.checkMatchBatch(task.k_start, task.r_ptr, task.n);
-                free_indices.push(task.stream_idx);
+                ScanTask task = scan_queue.pop();
+                if (task.exit_signal) break;
+
+                scanner.checkMatchBatch(task.k_start, task.r_values.get(), task.n);
             }
         });
     }
@@ -904,11 +1113,17 @@ int main(int argc, char **argv) {
     int blocks  = (n + threads - 1) / threads;
 
     printf("Starting Producer loop (GPU) with %d Workers...\n", num_workers);
+    printf("PendingScan cap: %d batches\n", max_pending_scan);
 
     std::atomic<long long> total_keys(0);
     auto start_time = std::chrono::high_resolution_clock::now();
 
     do {
+        // Throttle producer when scan queue is too deep to keep memory bounded.
+        while ((int)scan_queue.size() >= max_pending_scan) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+
         // 從空閒索引隊列取出一個 Buffer
         int idx = free_indices.pop();
 
@@ -923,14 +1138,14 @@ int main(int argc, char **argv) {
         
         // 3. 非同步拷貝回 Host
         checkCuda(cudaMemcpyAsync(h_r[idx], d_r[idx], X_bytes, cudaMemcpyDeviceToHost, streams[idx]), "async cpy");
+        checkCuda(cudaEventRecord(copy_done_events[idx], streams[idx]), "record copy event");
 
-        // 4. 立即丟進 Task Queue
-        BatchTask task;
-        task.stream_idx = idx;
-        memcpy(task.k_start, k_start, 32);
-        task.r_ptr = h_r[idx];
-        task.n = n;
-        task_queue.push(task);
+        // 4. 丟進完成佇列，由完成執行緒在 copy 結束後立刻回收 stream
+        PendingBatch batch;
+        batch.stream_idx = idx;
+        memcpy(batch.k_start, k_start, sizeof(batch.k_start));
+        batch.n = n;
+        completion_queue.push(std::move(batch));
 
         total_keys += n;
         static auto last_print = start_time;
@@ -940,8 +1155,8 @@ int main(int argc, char **argv) {
 
         if (print_elapsed.count() > 2.0) {
             double speed = total_keys / total_elapsed.count();
-            printf("\r[PRODUCER] Speed: %.2f keys/sec | Total: %lld | FreeBuff: %d", 
-                   speed, (long long)total_keys, (int)num_streams - (int)task_queue.size()); // Approx check
+             printf("\r[PRODUCER] Speed: %.2f keys/sec | Total: %lld | PendingCopy: %zu | PendingScan: %zu", 
+                 speed, (long long)total_keys, completion_queue.size(), scan_queue.size());
             fflush(stdout);
             last_print = current_time;
         }
@@ -956,11 +1171,17 @@ int main(int argc, char **argv) {
 
     } while (infinite);
 
-    // Shutdown workers
+    // Shutdown copy-completion worker after all producer batches are queued.
+    PendingBatch completion_sentinel;
+    completion_sentinel.exit_signal = true;
+    completion_queue.push(std::move(completion_sentinel));
+    completion_worker.join();
+
+    // Shutdown scan workers
     for (int i = 0; i < num_workers; i++) {
-        BatchTask sentinel;
-        sentinel.n = -1;
-        task_queue.push(sentinel);
+        ScanTask sentinel;
+        sentinel.exit_signal = true;
+        scan_queue.push(std::move(sentinel));
     }
     for (auto &t : workers) t.join();
 
@@ -972,6 +1193,16 @@ int main(int argc, char **argv) {
 
     // Cleanup MongoDB Driver (Global)
     mongoc_cleanup();
+
+    for (int i = 0; i < num_streams; i++) {
+        cudaFreeHost(h_r[i]);
+        cudaFree(d_X[i]);
+        cudaFree(d_Y[i]);
+        cudaFree(d_Z[i]);
+        cudaFree(d_r[i]);
+        cudaEventDestroy(copy_done_events[i]);
+        cudaStreamDestroy(streams[i]);
+    }
 
     return 0;
 }
