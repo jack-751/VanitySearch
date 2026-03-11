@@ -1,7 +1,7 @@
 /*
  * CalcR_GPU.cu
  *
- * CPU 產生 k 值 → GPU 計算 r = x(k·G) mod n (secp256k1 ECDSA)
+ * CPU 產生隨機 k 值 → GPU 計算 r = x(k*G) mod n (secp256k1 ECDSA)
  *
  * 策略：
  *   ① 每個 CUDA thread 負責一個 k 值。
@@ -23,8 +23,9 @@
  *   (sm_86 = RTX 3xxx/Ada；依卡型調整)
  *
  * 執行：
- *   ./CalcR_GPU [count] [k_start]  # count: 要計算的 k 值數量，預設 16
- *                                  # k_start: 起始 k 值，預設 1（可為大整數）
+ *   ./CalcR_GPU [count]  # count: 每批要計算的 k 值數量，預設 1048576
+ *                        # 傳入 0 表示無限迴圈模式
+ *                        # k 值由 CPU 透過 /dev/urandom 隨機產生
  */
 
  
@@ -960,6 +961,34 @@ static void checkCuda(cudaError_t err, const char *msg) {
     }
 }
 
+// ===========================================================================
+// CPU 端產生密碼學安全的隨機 256-bit k 值 (使用 /dev/urandom)
+// 保證 k ∈ [1, n-1]（n = secp256k1 群階數）
+// ===========================================================================
+static void generate_random_k(uint64_t k[4]) {
+    FILE *f = fopen("/dev/urandom", "rb");
+    if (!f) { perror("fopen /dev/urandom"); exit(1); }
+    while (true) {
+        if (fread(k, 32, 1, f) != 1) {
+            perror("fread /dev/urandom");
+            fclose(f);
+            exit(1);
+        }
+        // 檢查 k == 0
+        if (k[0] == 0 && k[1] == 0 && k[2] == 0 && k[3] == 0)
+            continue;
+        // 檢查 k >= n (HOST_N)
+        bool ge_n = (k[3] > HOST_N[3]) ||
+                    (k[3] == HOST_N[3] && k[2] > HOST_N[2]) ||
+                    (k[3] == HOST_N[3] && k[2] == HOST_N[2] && k[1] > HOST_N[1]) ||
+                    (k[3] == HOST_N[3] && k[2] == HOST_N[2] && k[1] == HOST_N[1] && k[0] >= HOST_N[0]);
+        if (ge_n)
+            continue;
+        break;  // k ∈ [1, n-1]，有效
+    }
+    fclose(f);
+}
+
 int main(int argc, char **argv) {
     int n = 1048576; 
     bool infinite = false;
@@ -973,13 +1002,9 @@ int main(int argc, char **argv) {
     }
     if (n <= 0) n = 1048576;
 
-    uint64_t k_start[4] = {1, 0, 0, 0};
-    if (argc > 2) parse256(k_start, argv[2]);
-    if (k_start[0] == 0 && k_start[1] == 0 && k_start[2] == 0 && k_start[3] == 0) k_start[0] = 1;
-
-    printf("=== CalcR_GPU: secp256k1 r = x(k*G) mod n (Multi-threaded Extreme) ===\n");
+    printf("=== CalcR_GPU: secp256k1 r = x(k*G) mod n (Random K Mode) ===\n");
     printf("批次大小: %d\n", n);
-    printHex256("起始 k", k_start);
+    printf("k 值由 CPU /dev/urandom 隨機產生\n");
     
     // Initialize MongoDB Driver (Global)
     mongoc_init();
@@ -1245,7 +1270,11 @@ int main(int argc, char **argv) {
         // 從空閒索引隊列取出一個 Buffer
         int idx = free_indices.pop();
 
-        // 2. 啟動 GPU 運算 (直接傳入 k_start，不需要在 CPU 算 1M 次)
+        // 1. CPU 產生隨機 k_start
+        uint64_t k_start[4];
+        generate_random_k(k_start);
+
+        // 2. 啟動 GPU 運算 (k = k_start + tid)
         ComputeKG_Jacobian<<<blocks, threads, 0, streams[idx]>>> (
             k_start[0], k_start[1], k_start[2], k_start[3], 
             d_X[idx], d_Y[idx], d_Z[idx], n
@@ -1277,14 +1306,6 @@ int main(int argc, char **argv) {
                    speed, (long long)total_keys, (int)num_streams - (int)task_queue.size()); // Approx check
             fflush(stdout);
             last_print = current_time;
-        }
-
-        // 遞增 k_start
-        uint64_t carry = (uint64_t)n;
-        for (int j = 0; j < 4; j++) {
-            uint64_t val = k_start[j];
-            k_start[j] = val + carry;
-            carry = (k_start[j] < val) ? 1 : 0;
         }
 
     } while (infinite);
