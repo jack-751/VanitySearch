@@ -25,7 +25,13 @@
  * 執行：
  *   ./CalcR_GPU [count] [k_start]  # count: 要計算的 k 值數量，預設 16
  *                                  # k_start: 起始 k 值，預設 1（可為大整數）
- */
+
+SCAN_WORKERS=2 MAX_PENDING_SCAN=8 ./CalcR_GPU 0
+如果 RAM 還高，降成 MAX_PENDING_SCAN=4
+如果 GPU 利用率掉太多，再慢慢加回 MAX_PENDING_SCAN
+
+ SCAN_WORKERS=2 MAX_PENDING_SCAN=2 ./CalcR_GPU 0 0x3e4c0d2798be2c0b4da595e082a707335bf812abeda97c750d72718728a3d6c
+*/
 
  
 #include <cstdio>
