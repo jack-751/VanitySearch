@@ -91,6 +91,9 @@ __device__ __constant__ uint64_t DEV_P[4];
 __device__ __constant__ uint64_t DEV_N[4];
 __device__ __constant__ uint64_t DEV_GX[4];
 __device__ __constant__ uint64_t DEV_GY[4];
+// 預計算表: DEV_TABLE[j] = (j+1)·G, j=0..14 (即 1·G ~ 15·G 的仿射座標)
+__device__ __constant__ uint64_t DEV_TABLE_X[15][4];
+__device__ __constant__ uint64_t DEV_TABLE_Y[15][4];
 
 // ===========================================================================
 // Jacobian 座標下的 secp256k1 點運算 (GPU __device__)
@@ -267,49 +270,54 @@ __device__ void JacMixedAdd(
 }
 
 // ===========================================================================
-// 256-bit double-and-add (Jacobian): 計算 k*G, 結果 Jacobian 座標
-// k 以 4 個 uint64 (小端) 表示。
+// Fixed-Window (w=4) 純量乘法: 計算 k*G, 結果 Jacobian 座標
+// 使用預計算表 DEV_TABLE_X/Y[j] = (j+1)·G (j=0..14)
+// 每次處理 k 的 4 bit 窗口：4 次 JacDouble + 1 次 JacMixedAdd
 // ===========================================================================
 __device__ void ScalarMultG_Jacobian(
     uint64_t Rx[4], uint64_t Ry[4], uint64_t Rz[4],
     const uint64_t k[4])
 {
-    // 初始化結果為無窮遠點 (用 Z=0 表示)
-    Rx[0]=0; Rx[1]=0; Rx[2]=0; Rx[3]=0;
-    Ry[0]=1; Ry[1]=0; Ry[2]=0; Ry[3]=0;
-    Rz[0]=0; Rz[1]=0; Rz[2]=0; Rz[3]=0;  // Z=0 → 無窮遠點
-
-    uint64_t Tx[4], Ty[4], Tz[4]; // 暫存倍增點
-
-    // 從最高有效位元開始，逐位元 double-and-add
+    uint64_t Tx[4], Ty[4], Tz[4];
     bool started = false;
 
-    for (int word = 3; word >= 0; word--) {
-        for (int bit = 63; bit >= 0; bit--) {
-            if (started) {
-                // 倍增
+    // 從最高 4-bit 窗口 (window 63) 到最低 (window 0)
+    for (int w = 63; w >= 0; w--) {
+        // 倍增 4 次 (shift left by 4 bits)
+        if (started) {
+            for (int d = 0; d < 4; d++) {
                 JacDouble(Tx, Ty, Tz, Rx, Ry, Rz);
                 Rx[0]=Tx[0]; Rx[1]=Tx[1]; Rx[2]=Tx[2]; Rx[3]=Tx[3];
                 Ry[0]=Ty[0]; Ry[1]=Ty[1]; Ry[2]=Ty[2]; Ry[3]=Ty[3];
                 Rz[0]=Tz[0]; Rz[1]=Tz[1]; Rz[2]=Tz[2]; Rz[3]=Tz[3];
             }
-            if ((k[word] >> bit) & 1ULL) {
-                if (!started) {
-                    // 第一個 1 bit：直接把 G 放入結果
-                    Rx[0]=DEV_GX[0]; Rx[1]=DEV_GX[1]; Rx[2]=DEV_GX[2]; Rx[3]=DEV_GX[3];
-                    Ry[0]=DEV_GY[0]; Ry[1]=DEV_GY[1]; Ry[2]=DEV_GY[2]; Ry[3]=DEV_GY[3];
-                    Rz[0]=1;         Rz[1]=0;          Rz[2]=0;          Rz[3]=0; // Z=1
-                    started = true;
-                } else {
-                    // 一般加法：Jacobian + Affine(G)
-                    JacMixedAdd(Tx, Ty, Tz, Rx, Ry, Rz, DEV_GX, DEV_GY);
-                    Rx[0]=Tx[0]; Rx[1]=Tx[1]; Rx[2]=Tx[2]; Rx[3]=Tx[3];
-                    Ry[0]=Ty[0]; Ry[1]=Ty[1]; Ry[2]=Ty[2]; Ry[3]=Ty[3];
-                    Rz[0]=Tz[0]; Rz[1]=Tz[1]; Rz[2]=Tz[2]; Rz[3]=Tz[3];
-                }
+        }
+
+        // 提取 4-bit 窗口值
+        int limb = w / 16;          // 哪個 uint64
+        int shift = (w % 16) * 4;   // 在 uint64 中的 bit 偏移
+        int wval = (int)((k[limb] >> shift) & 0xFULL);
+
+        if (wval != 0) {
+            if (!started) {
+                // 第一個非零窗口：直接載入 table[wval-1]
+                Rx[0]=DEV_TABLE_X[wval-1][0]; Rx[1]=DEV_TABLE_X[wval-1][1];
+                Rx[2]=DEV_TABLE_X[wval-1][2]; Rx[3]=DEV_TABLE_X[wval-1][3];
+                Ry[0]=DEV_TABLE_Y[wval-1][0]; Ry[1]=DEV_TABLE_Y[wval-1][1];
+                Ry[2]=DEV_TABLE_Y[wval-1][2]; Ry[3]=DEV_TABLE_Y[wval-1][3];
+                Rz[0]=1; Rz[1]=0; Rz[2]=0; Rz[3]=0;
+                started = true;
+            } else {
+                // 混合加法：R += table[wval-1]
+                JacMixedAdd(Tx, Ty, Tz, Rx, Ry, Rz,
+                            DEV_TABLE_X[wval-1], DEV_TABLE_Y[wval-1]);
+                Rx[0]=Tx[0]; Rx[1]=Tx[1]; Rx[2]=Tx[2]; Rx[3]=Tx[3];
+                Ry[0]=Ty[0]; Ry[1]=Ty[1]; Ry[2]=Ty[2]; Ry[3]=Ty[3];
+                Rz[0]=Tz[0]; Rz[1]=Tz[1]; Rz[2]=Tz[2]; Rz[3]=Tz[3];
             }
         }
     }
+    // 若 k==0 (不應發生), R 保持未初始化 — 由呼叫端保證 k >= 1
 }
 
 // ===========================================================================
@@ -989,6 +997,137 @@ static void generate_random_k(uint64_t k[4]) {
     fclose(f);
 }
 
+// ===========================================================================
+// CPU-side 256-bit 模算術 (僅用於啟動時預計算 j·G 表)
+// ===========================================================================
+static int host_cmp256_ge(const uint64_t a[4], const uint64_t b[4]) {
+    for (int i = 3; i >= 0; i--) {
+        if (a[i] > b[i]) return 1;
+        if (a[i] < b[i]) return 0;
+    }
+    return 1;
+}
+
+static uint64_t host_add256(uint64_t r[4], const uint64_t a[4], const uint64_t b[4]) {
+    __uint128_t c = 0;
+    for (int i = 0; i < 4; i++) { c += (__uint128_t)a[i] + b[i]; r[i] = (uint64_t)c; c >>= 64; }
+    return (uint64_t)c;
+}
+
+static uint64_t host_sub256(uint64_t r[4], const uint64_t a[4], const uint64_t b[4]) {
+    int64_t borrow = 0;
+    for (int i = 0; i < 4; i++) {
+        __int128_t d = (__int128_t)a[i] - b[i] - borrow;
+        r[i] = (uint64_t)d; borrow = (d < 0) ? 1 : 0;
+    }
+    return (uint64_t)borrow;
+}
+
+static void h_mod_add(uint64_t r[4], const uint64_t a[4], const uint64_t b[4]) {
+    uint64_t c = host_add256(r, a, b);
+    if (c || host_cmp256_ge(r, HOST_P)) host_sub256(r, r, HOST_P);
+}
+
+static void h_mod_sub(uint64_t r[4], const uint64_t a[4], const uint64_t b[4]) {
+    uint64_t b_ = host_sub256(r, a, b);
+    if (b_) host_add256(r, r, HOST_P);
+}
+
+static void h_mod_mul(uint64_t r[4], const uint64_t a[4], const uint64_t b[4]) {
+    uint64_t t[8] = {0};
+    for (int i = 0; i < 4; i++) {
+        __uint128_t carry = 0;
+        for (int j = 0; j < 4; j++) {
+            carry += (__uint128_t)a[i] * b[j] + t[i + j];
+            t[i + j] = (uint64_t)carry; carry >>= 64;
+        }
+        t[i + 4] = (uint64_t)carry;
+    }
+    // P = 2^256 - C, C = 0x1000003D1
+    const uint64_t C = 0x1000003D1ULL;
+    // Round 1: tmp = t_low + t_high * C
+    __uint128_t carry = 0;
+    uint64_t tmp[5];
+    for (int i = 0; i < 4; i++) {
+        carry += (__uint128_t)t[i + 4] * C + t[i];
+        tmp[i] = (uint64_t)carry; carry >>= 64;
+    }
+    tmp[4] = (uint64_t)carry;
+    // Round 2: r = tmp[0..3] + tmp[4] * C
+    carry = (__uint128_t)tmp[4] * C;
+    for (int i = 0; i < 4; i++) {
+        carry += tmp[i]; r[i] = (uint64_t)carry; carry >>= 64;
+    }
+    if (carry || host_cmp256_ge(r, HOST_P)) host_sub256(r, r, HOST_P);
+}
+
+static void h_mod_sqr(uint64_t r[4], const uint64_t a[4]) { h_mod_mul(r, a, a); }
+
+// a^{-1} mod P via Fermat: a^{P-2} mod P (square-and-multiply)
+static void h_mod_inv(uint64_t r[4], const uint64_t a[4]) {
+    // P-2 = FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2D
+    uint64_t pm2[4] = { HOST_P[0] - 2, HOST_P[1], HOST_P[2], HOST_P[3] };
+    uint64_t base[4] = { a[0], a[1], a[2], a[3] };
+    r[0] = 1; r[1] = 0; r[2] = 0; r[3] = 0;
+    for (int w = 0; w < 4; w++) {
+        for (int bit = 0; bit < 64; bit++) {
+            if ((pm2[w] >> bit) & 1) h_mod_mul(r, r, base);
+            h_mod_sqr(base, base);
+        }
+    }
+}
+
+// 仿射座標點倍增: (x3,y3) = 2*(px,py)
+static void h_point_double(uint64_t x3[4], uint64_t y3[4],
+                           const uint64_t px[4], const uint64_t py[4]) {
+    // lambda = 3*x^2 / (2*y)  (a=0 for secp256k1)
+    uint64_t x2[4], num[4], den[4], inv_den[4], lam[4], lam2[4], tmp[4];
+    h_mod_sqr(x2, px);           // x^2
+    h_mod_add(num, x2, x2);     // 2*x^2
+    h_mod_add(num, num, x2);    // 3*x^2
+    h_mod_add(den, py, py);     // 2*y
+    h_mod_inv(inv_den, den);
+    h_mod_mul(lam, num, inv_den);
+    h_mod_sqr(lam2, lam);       // lambda^2
+    h_mod_add(tmp, px, px);     // 2*x
+    h_mod_sub(x3, lam2, tmp);   // x3 = lambda^2 - 2*x
+    h_mod_sub(tmp, px, x3);     // x - x3
+    h_mod_mul(y3, lam, tmp);    // lambda*(x - x3)
+    h_mod_sub(y3, y3, py);      // y3 = lambda*(x - x3) - y
+}
+
+// 仿射座標點加法: (x3,y3) = (p1x,p1y) + (p2x,p2y)
+static void h_point_add(uint64_t x3[4], uint64_t y3[4],
+                        const uint64_t p1x[4], const uint64_t p1y[4],
+                        const uint64_t p2x[4], const uint64_t p2y[4]) {
+    uint64_t dy[4], dx[4], inv_dx[4], lam[4], lam2[4], tmp[4];
+    h_mod_sub(dy, p2y, p1y);
+    h_mod_sub(dx, p2x, p1x);
+    h_mod_inv(inv_dx, dx);
+    h_mod_mul(lam, dy, inv_dx);
+    h_mod_sqr(lam2, lam);
+    h_mod_sub(x3, lam2, p1x);
+    h_mod_sub(x3, x3, p2x);
+    h_mod_sub(tmp, p1x, x3);
+    h_mod_mul(y3, lam, tmp);
+    h_mod_sub(y3, y3, p1y);
+}
+
+// 預計算 table[j] = (j+1)·G (j=0..14) 的仿射座標
+static void precompute_G_table(uint64_t tx[15][4], uint64_t ty[15][4]) {
+    // table[0] = 1·G
+    memcpy(tx[0], HOST_GX, 32);
+    memcpy(ty[0], HOST_GY, 32);
+    // table[1] = 2·G
+    h_point_double(tx[1], ty[1], tx[0], ty[0]);
+    // table[j] = table[j-1] + G  for j >= 2
+    for (int j = 2; j < 15; j++) {
+        h_point_add(tx[j], ty[j], tx[j - 1], ty[j - 1], tx[0], ty[0]);
+    }
+    printf("[Precompute] 已計算 15 個 j·G 仿射座標點\n");
+}
+
+
 int main(int argc, char **argv) {
     int n = 1048576; 
     bool infinite = false;
@@ -1013,6 +1152,12 @@ int main(int argc, char **argv) {
     checkCuda(cudaMemcpyToSymbol(DEV_N,  HOST_N,  32), "cpyN");
     checkCuda(cudaMemcpyToSymbol(DEV_GX, HOST_GX, 32), "cpyGx");
     checkCuda(cudaMemcpyToSymbol(DEV_GY, HOST_GY, 32), "cpyGy");
+
+    // 預計算 j·G (j=1..15) 並上傳到 GPU constant memory
+    uint64_t table_x[15][4], table_y[15][4];
+    precompute_G_table(table_x, table_y);
+    checkCuda(cudaMemcpyToSymbol(DEV_TABLE_X, table_x, sizeof(table_x)), "cpyTableX");
+    checkCuda(cudaMemcpyToSymbol(DEV_TABLE_Y, table_y, sizeof(table_y)), "cpyTableY");
 
     // -----------------------------------------------------------------------
     // 分配 Ring Buffer 與 CUDA Streams (增加到 32 個以對抗 Redis 延遲)
@@ -1041,11 +1186,11 @@ int main(int argc, char **argv) {
     const int num_workers = 16;
 
     // -----------------------------------------------------------------------
-    // GPU Bloom Filter 初始化 (15 billion keys @ 3% FPR)
+    // GPU Bloom Filter 初始化 (1.5B keys @ 0.05% FPR)
     // -----------------------------------------------------------------------
     uint64_t expected_mongo_keys = 1500000000ULL;   // 1.5 billion keys
-    double fpr = 0.03;                              // 3% false positive rate
-    const size_t bloom_budget_mb = 1536;            // VRAM budget for Bloom bits
+    double fpr = 0.0005;                            // 0.05% false positive rate
+    const size_t bloom_budget_mb = 8000;            // VRAM budget for Bloom bits
     
     // 計算最優 bit 數：m = -n*ln(p) / (ln(2)^2)
     uint64_t ideal_bits = (uint64_t)(-(double)expected_mongo_keys * log(fpr) / (log(2) * log(2)));
@@ -1055,17 +1200,17 @@ int main(int argc, char **argv) {
     // 計算最優 hash 函數數：k = (m/n) * ln(2)
     int bloom_num_hashes = (int)llround((double)bloom_num_bits / expected_mongo_keys * log(2));
     if (bloom_num_hashes < 1) bloom_num_hashes = 1;
-    if (bloom_num_hashes > 10) bloom_num_hashes = 10;
+    if (bloom_num_hashes > 20) bloom_num_hashes = 20;
     
-        printf("[Bloom Filter] 初始化: %llu bits (%.2f MB), %d hash functions\n",
-            (unsigned long long)bloom_num_bits,
-            (double)bloom_num_bits / 8.0 / 1024.0 / 1024.0,
-            bloom_num_hashes);
-        if (ideal_bits > budget_bits) {
-         printf("[Bloom Filter] 已套用 %zu MB 顯存上限（理想需求 %.2f MB）\n",
-             bloom_budget_mb,
-             (double)ideal_bits / 8.0 / 1024.0 / 1024.0);
-        }
+    printf("[Bloom Filter] 初始化: %llu bits (%.2f MB), %d hash functions, FPR=%.4f%%\n",
+        (unsigned long long)bloom_num_bits,
+        (double)bloom_num_bits / 8.0 / 1024.0 / 1024.0,
+        bloom_num_hashes, fpr * 100.0);
+    if (ideal_bits > budget_bits) {
+        printf("[Bloom Filter] 已套用 %zu MB 顯存上限（理想需求 %.2f MB）\n",
+            bloom_budget_mb,
+            (double)ideal_bits / 8.0 / 1024.0 / 1024.0);
+    }
     
     // 分配 GPU 記憶體用於 Bloom Filter
     size_t bloom_array_size = (bloom_num_bits + 63) / 64;
@@ -1076,132 +1221,249 @@ int main(int argc, char **argv) {
     printf("[Bloom Filter] 共分配 %.2f MB 的 GPU 記憶體\n",
            (double)bloom_array_size * sizeof(uint64_t) / 1024.0 / 1024.0);
     
-    // 啟動 Bloom Filter 加載線程（從 Redis 流式讀取）
+    // -----------------------------------------------------------------------
+    // Bloom Filter 快取檔案: 優先從檔案載入，否則從 Redis 建立後存檔
+    // 檔案格式: [header 32 bytes] + [bloom bit array]
+    // header: magic(8) + version(4) + num_bits(8) + num_hashes(4) + key_count(8)
+    // -----------------------------------------------------------------------
+    const char *bloom_cache_path = "bloom_cache.bin";
     std::atomic<bool> bloom_loader_done(false);
     std::atomic<bool> bloom_filter_ready(false);
     std::atomic<uint64_t> bloom_loaded_count(0);
     
-    std::thread bloom_loader([&]() {
-        redisContext *rc = redisConnect("127.0.0.1", 6379);
-        if (rc == nullptr || rc->err) {
-            fprintf(stderr, "[Bloom Loader] Redis連線失敗: %s\n", (rc && rc->errstr) ? rc->errstr : "unknown");
-            if (rc) redisFree(rc);
-            bloom_loader_done = true;
-            return;
+    // 嘗試從快取檔案載入
+    bool loaded_from_cache = false;
+    {
+        FILE *cf = fopen(bloom_cache_path, "rb");
+        if (cf) {
+            // 讀取 header
+            uint64_t magic = 0;
+            uint32_t version = 0;
+            uint64_t file_num_bits = 0;
+            uint32_t file_num_hashes = 0;
+            uint64_t file_key_count = 0;
+            
+            bool header_ok = (fread(&magic, 8, 1, cf) == 1) &&
+                             (fread(&version, 4, 1, cf) == 1) &&
+                             (fread(&file_num_bits, 8, 1, cf) == 1) &&
+                             (fread(&file_num_hashes, 4, 1, cf) == 1) &&
+                             (fread(&file_key_count, 8, 1, cf) == 1);
+            
+            if (header_ok && magic == 0x424C4F4F4D465430ULL /* "BLOOMFT0" */ &&
+                version == 1 &&
+                file_num_bits == bloom_num_bits &&
+                (int)file_num_hashes == bloom_num_hashes) {
+                
+                printf("[Bloom Cache] 找到快取檔案，參數匹配 (bits=%llu, hashes=%d, keys=%llu)\n",
+                       (unsigned long long)file_num_bits, (int)file_num_hashes,
+                       (unsigned long long)file_key_count);
+                printf("[Bloom Cache] 正在從檔案載入 %.2f MB...\n",
+                       (double)bloom_array_size * sizeof(uint64_t) / 1024.0 / 1024.0);
+                
+                // 分批讀入 host buffer 再上傳 GPU（避免一次分配太大 host memory）
+                const size_t chunk_words = 16 * 1024 * 1024; // 128MB per chunk
+                uint64_t *host_buf = (uint64_t *)malloc(chunk_words * sizeof(uint64_t));
+                if (host_buf) {
+                    size_t remaining = bloom_array_size;
+                    size_t offset = 0;
+                    bool read_ok = true;
+                    while (remaining > 0) {
+                        size_t to_read = (remaining < chunk_words) ? remaining : chunk_words;
+                        if (fread(host_buf, sizeof(uint64_t), to_read, cf) != to_read) {
+                            fprintf(stderr, "[Bloom Cache] 讀取失敗，將從 Redis 重建\n");
+                            read_ok = false;
+                            break;
+                        }
+                        checkCuda(cudaMemcpy(dev_bloom_bits + offset, host_buf,
+                                            to_read * sizeof(uint64_t), cudaMemcpyHostToDevice),
+                                 "Bloom cache upload");
+                        offset += to_read;
+                        remaining -= to_read;
+                    }
+                    free(host_buf);
+                    if (read_ok) {
+                        loaded_from_cache = true;
+                        bloom_loaded_count = file_key_count;
+                        bloom_filter_ready = true;
+                        bloom_loader_done = true;
+                        printf("[Bloom Cache] 載入完成！%llu 個 keys，Bloom 已啟用\n",
+                               (unsigned long long)file_key_count);
+                    }
+                }
+            } else if (header_ok) {
+                printf("[Bloom Cache] 快取檔案參數不匹配 (file: bits=%llu hashes=%d, need: bits=%llu hashes=%d)，將重建\n",
+                       (unsigned long long)file_num_bits, (int)file_num_hashes,
+                       (unsigned long long)bloom_num_bits, bloom_num_hashes);
+            }
+            fclose(cf);
+        } else {
+            printf("[Bloom Cache] 無快取檔案 (%s)，將從 Redis 建立\n", bloom_cache_path);
         }
-
-        timeval redis_timeout;
-        redis_timeout.tv_sec = 30;
-        redis_timeout.tv_usec = 0;
-        redisSetTimeout(rc, redis_timeout);
-
-        printf("[Bloom Loader] 開始從 Redis SSCAN 載入 Bloom bits...\n");
-        
-        uint64_t cursor = 0;
-        const uint64_t batch_size = 1000000;   // 每批 1M keys，降低 Redis 壓力
-        size_t loader_capacity = (size_t)batch_size;
-        char *batch_hex = new char[loader_capacity * 11];
-        char *dev_loader_hex_buffer = nullptr;
-        checkCuda(cudaMalloc(&dev_loader_hex_buffer, loader_capacity * 11), "Bloom loader hex malloc");
-        cudaStream_t bloom_stream;
-        checkCuda(cudaStreamCreate(&bloom_stream), "Bloom loader stream create");
-        bool load_ok = true;
-        int consecutive_errors = 0;
-        
-        do {
-            char cmd[256];
-            snprintf(cmd, sizeof(cmd), "SSCAN mongo_keys %llu COUNT %llu",
-                     (unsigned long long)cursor,
-                     (unsigned long long)batch_size);
-            redisReply *reply = (redisReply *)redisCommand(rc, cmd);
-            
-            if (reply == nullptr || reply->type != REDIS_REPLY_ARRAY || reply->elements != 2) {
-                consecutive_errors++;
-                fprintf(stderr, "[Bloom Loader] SSCAN 失敗 (retry=%d): %s\n", consecutive_errors,
-                        rc->errstr ? rc->errstr : "unexpected reply");
-                if (reply) freeReplyObject(reply);
-                if (consecutive_errors >= 5) {
-                    load_ok = false;
-                    break;
-                }
-                std::this_thread::sleep_for(std::chrono::milliseconds(200 * consecutive_errors));
-                continue;
+    }
+    
+    // 若快取未命中，從 Redis SSCAN 建立，完成後存檔
+    if (!loaded_from_cache) {
+        std::thread bloom_loader([&]() {
+            redisContext *rc = redisConnect("127.0.0.1", 6379);
+            if (rc == nullptr || rc->err) {
+                fprintf(stderr, "[Bloom Loader] Redis連線失敗: %s\n", (rc && rc->errstr) ? rc->errstr : "unknown");
+                if (rc) redisFree(rc);
+                bloom_loader_done = true;
+                return;
             }
-            consecutive_errors = 0;
-            
-            // 提取 cursor
-            redisReply *cursor_reply = reply->element[0];
-            if (cursor_reply->type == REDIS_REPLY_STRING) {
-                cursor = strtoull(cursor_reply->str, nullptr, 10);
-            }
-            
-            // 提取 keys 並加載到 GPU Bloom Filter
-            redisReply *keys_reply = reply->element[1];
-            if (keys_reply->type == REDIS_REPLY_ARRAY) {
-                if (keys_reply->elements > loader_capacity) {
-                    size_t new_capacity = keys_reply->elements;
-                    delete[] batch_hex;
-                    batch_hex = new char[new_capacity * 11];
-                    if (dev_loader_hex_buffer) cudaFree(dev_loader_hex_buffer);
-                    checkCuda(cudaMalloc(&dev_loader_hex_buffer, new_capacity * 11), "Bloom loader hex realloc");
-                    loader_capacity = new_capacity;
-                    printf("\n[Bloom Loader] 緩衝區擴容至 %zu keys\n", loader_capacity);
-                }
 
-                size_t valid_count = 0;
-                for (size_t i = 0; i < keys_reply->elements; i++) {
-                    const char *key = keys_reply->element[i]->str;
-                    if (key != nullptr && strlen(key) >= 11) {
-                        memcpy(batch_hex + valid_count * 11, key, 11);
-                        valid_count++;
+            timeval redis_timeout;
+            redis_timeout.tv_sec = 30;
+            redis_timeout.tv_usec = 0;
+            redisSetTimeout(rc, redis_timeout);
+
+            printf("[Bloom Loader] 開始從 Redis SSCAN 載入 Bloom bits...\n");
+            
+            uint64_t cursor = 0;
+            const uint64_t batch_size = 1000000;
+            size_t loader_capacity = (size_t)batch_size;
+            char *batch_hex = new char[loader_capacity * 11];
+            char *dev_loader_hex_buffer = nullptr;
+            checkCuda(cudaMalloc(&dev_loader_hex_buffer, loader_capacity * 11), "Bloom loader hex malloc");
+            cudaStream_t bloom_stream;
+            checkCuda(cudaStreamCreate(&bloom_stream), "Bloom loader stream create");
+            bool load_ok = true;
+            int consecutive_errors = 0;
+            
+            do {
+                char cmd[256];
+                snprintf(cmd, sizeof(cmd), "SSCAN mongo_keys %llu COUNT %llu",
+                         (unsigned long long)cursor,
+                         (unsigned long long)batch_size);
+                redisReply *reply = (redisReply *)redisCommand(rc, cmd);
+                
+                if (reply == nullptr || reply->type != REDIS_REPLY_ARRAY || reply->elements != 2) {
+                    consecutive_errors++;
+                    fprintf(stderr, "[Bloom Loader] SSCAN 失敗 (retry=%d): %s\n", consecutive_errors,
+                            rc->errstr ? rc->errstr : "unexpected reply");
+                    if (reply) freeReplyObject(reply);
+                    if (consecutive_errors >= 5) {
+                        load_ok = false;
+                        break;
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(200 * consecutive_errors));
+                    continue;
+                }
+                consecutive_errors = 0;
+                
+                redisReply *cursor_reply = reply->element[0];
+                if (cursor_reply->type == REDIS_REPLY_STRING) {
+                    cursor = strtoull(cursor_reply->str, nullptr, 10);
+                }
+                
+                redisReply *keys_reply = reply->element[1];
+                if (keys_reply->type == REDIS_REPLY_ARRAY) {
+                    if (keys_reply->elements > loader_capacity) {
+                        size_t new_capacity = keys_reply->elements;
+                        delete[] batch_hex;
+                        batch_hex = new char[new_capacity * 11];
+                        if (dev_loader_hex_buffer) cudaFree(dev_loader_hex_buffer);
+                        checkCuda(cudaMalloc(&dev_loader_hex_buffer, new_capacity * 11), "Bloom loader hex realloc");
+                        loader_capacity = new_capacity;
+                        printf("\n[Bloom Loader] 緩衝區擴容至 %zu keys\n", loader_capacity);
+                    }
+
+                    size_t valid_count = 0;
+                    for (size_t i = 0; i < keys_reply->elements; i++) {
+                        const char *key = keys_reply->element[i]->str;
+                        if (key != nullptr && strlen(key) >= 11) {
+                            memcpy(batch_hex + valid_count * 11, key, 11);
+                            valid_count++;
+                        }
+                    }
+                    
+                    if (valid_count > 0) {
+                        size_t copy_size = valid_count * 11;
+                        checkCuda(cudaMemcpyAsync(dev_loader_hex_buffer, batch_hex, copy_size, cudaMemcpyHostToDevice, bloom_stream),
+                                 "Bloom loader memcpy");
+                        
+                        int threads = 256;
+                        int blocks = ((int)valid_count + threads - 1) / threads;
+                        gpu_bloom_add_batch<<<blocks, threads, 0, bloom_stream>>>(dev_bloom_bits, bloom_num_bits, bloom_num_hashes,
+                                                                                   dev_loader_hex_buffer, (int)valid_count, 11);
+                        
+                        checkCuda(cudaStreamSynchronize(bloom_stream), "Bloom add batch");
+                        bloom_loaded_count += valid_count;
+                        
+                        printf("[Bloom Loader] \r已加載 %llu 個 keys...",
+                            (unsigned long long)bloom_loaded_count.load());
+                        fflush(stdout);
                     }
                 }
                 
-                if (valid_count > 0) {
-                    size_t copy_size = valid_count * 11;
-                    checkCuda(cudaMemcpyAsync(dev_loader_hex_buffer, batch_hex, copy_size, cudaMemcpyHostToDevice, bloom_stream),
-                             "Bloom loader memcpy");
+                freeReplyObject(reply);
+                
+            } while (cursor != 0);
+            
+            if (dev_loader_hex_buffer) cudaFree(dev_loader_hex_buffer);
+            cudaStreamDestroy(bloom_stream);
+            delete[] batch_hex;
+            redisFree(rc);
+            bloom_filter_ready = (load_ok && cursor == 0);
+            bloom_loader_done = true;
+            
+            if (bloom_filter_ready.load()) {
+                printf("\n[Bloom Loader] 完成！已加載 %llu 個 keys\n",
+                       (unsigned long long)bloom_loaded_count.load());
+                
+                // === 存檔 Bloom 快取到磁碟 ===
+                printf("[Bloom Cache] 正在存檔 %.2f MB 到 %s...\n",
+                       (double)bloom_array_size * sizeof(uint64_t) / 1024.0 / 1024.0,
+                       bloom_cache_path);
+                FILE *cf = fopen(bloom_cache_path, "wb");
+                if (cf) {
+                    uint64_t magic = 0x424C4F4F4D465430ULL; // "BLOOMFT0"
+                    uint32_t version = 1;
+                    uint64_t file_num_bits = bloom_num_bits;
+                    uint32_t file_num_hashes = (uint32_t)bloom_num_hashes;
+                    uint64_t file_key_count = bloom_loaded_count.load();
+                    fwrite(&magic, 8, 1, cf);
+                    fwrite(&version, 4, 1, cf);
+                    fwrite(&file_num_bits, 8, 1, cf);
+                    fwrite(&file_num_hashes, 4, 1, cf);
+                    fwrite(&file_key_count, 8, 1, cf);
                     
-                    int threads = 256;
-                    int blocks = ((int)valid_count + threads - 1) / threads;
-                    gpu_bloom_add_batch<<<blocks, threads, 0, bloom_stream>>>(dev_bloom_bits, bloom_num_bits, bloom_num_hashes,
-                                                                               dev_loader_hex_buffer, (int)valid_count, 11);
-                    
-                    checkCuda(cudaStreamSynchronize(bloom_stream), "Bloom add batch");
-                    bloom_loaded_count += valid_count;
-                    
-                          printf("[Bloom Loader] \r已加載 %llu 個 keys...",
-                              (unsigned long long)bloom_loaded_count.load());
-                    fflush(stdout);
+                    const size_t chunk_words = 16 * 1024 * 1024; // 128MB per chunk
+                    uint64_t *host_buf = (uint64_t *)malloc(chunk_words * sizeof(uint64_t));
+                    if (host_buf) {
+                        size_t remaining = bloom_array_size;
+                        size_t offset = 0;
+                        while (remaining > 0) {
+                            size_t to_write = (remaining < chunk_words) ? remaining : chunk_words;
+                            checkCuda(cudaMemcpy(host_buf, dev_bloom_bits + offset,
+                                                to_write * sizeof(uint64_t), cudaMemcpyDeviceToHost),
+                                     "Bloom cache download");
+                            fwrite(host_buf, sizeof(uint64_t), to_write, cf);
+                            offset += to_write;
+                            remaining -= to_write;
+                        }
+                        free(host_buf);
+                    }
+                    fclose(cf);
+                    printf("[Bloom Cache] 存檔完成！下次啟動將自動載入\n");
+                } else {
+                    fprintf(stderr, "[Bloom Cache] 無法建立快取檔案: %s\n", bloom_cache_path);
                 }
+            } else {
+                printf("\n[Bloom Loader] 未完成（已加載 %llu 個 keys），維持 Redis 全量校驗\n",
+                       (unsigned long long)bloom_loaded_count.load());
             }
-            
-            freeReplyObject(reply);
-            
-        } while (cursor != 0);
-        
-        if (dev_loader_hex_buffer) cudaFree(dev_loader_hex_buffer);
-        cudaStreamDestroy(bloom_stream);
-        delete[] batch_hex;
-        redisFree(rc);
-        bloom_filter_ready = (load_ok && cursor == 0);
-        bloom_loader_done = true;
-        if (bloom_filter_ready.load()) {
-            printf("\n[Bloom Loader] 完成！已加載 %llu 個 keys，Bloom 已啟用\n",
-                   (unsigned long long)bloom_loaded_count.load());
-        } else {
-            printf("\n[Bloom Loader] 未完成（已加載 %llu 個 keys），維持 Redis 全量校驗\n",
-                   (unsigned long long)bloom_loaded_count.load());
-        }
-    });
-    printf("[Bloom Loader] 等待 Bloom 載入完成後再啟動主流程...\n");
-    bloom_loader.join();
+        });
+        printf("[Bloom Loader] 等待 Bloom 載入完成後再啟動主流程...\n");
+        bloom_loader.join();
+    }
+    
     if (!bloom_filter_ready.load()) {
-        fprintf(stderr, "[Bloom Loader] 初始化失敗，終止主流程以避免漏檢。\n");
+        fprintf(stderr, "[Bloom] 初始化失敗，終止主流程以避免漏檢。\n");
         mongoc_cleanup();
         return 1;
     }
-    printf("[Bloom Loader] 已完成，開始主流程。\n");
+    printf("[Bloom] 就緒，開始主流程。\n");
     
     SafeQueue<BatchTask> task_queue;
     SafeQueue<int> free_indices;
