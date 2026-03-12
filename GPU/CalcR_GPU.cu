@@ -565,24 +565,45 @@ static std::string hex256(const uint64_t v[4]) {
     return std::string(buf);
 }
 
-static bool parse_hex44(uint64_t *out, const char *s) {
-    if (!out || !s) return false;
+// 112-bit tag: lo = lower 64 bits (bits 0-63), hi = upper 48 bits (bits 64-111)
+struct Tag80 {
+    uint64_t lo;
+    uint64_t hi;  // only bits 0-47 used
+    bool operator<(const Tag80 &o) const {
+        if (hi != o.hi) return hi < o.hi;
+        return lo < o.lo;
+    }
+    bool operator==(const Tag80 &o) const {
+        return lo == o.lo && hi == o.hi;
+    }
+};
 
-    uint64_t value = 0;
-    int digits = 0;
-    while (*s && digits < 11) {
-        char c = *s++;
+// 解析字串最後 28 個 hex 字元為 Tag80 (112 bits)
+// hi = 前 12 hex (48 bits), lo = 後 16 hex (64 bits)
+static bool parse_last28hex(Tag80 *out, const char *s, uint32_t len) {
+    if (!out || !s || len < 28) return false;
+    const char *p = s + len - 28;
+    uint64_t hi = 0, lo = 0;
+    for (int i = 0; i < 12; i++) {
+        char c = p[i];
         uint64_t nibble = 0;
         if (c >= '0' && c <= '9') nibble = (uint64_t)(c - '0');
         else if (c >= 'a' && c <= 'f') nibble = (uint64_t)(c - 'a' + 10);
         else if (c >= 'A' && c <= 'F') nibble = (uint64_t)(c - 'A' + 10);
         else return false;
-        value = (value << 4) | nibble;
-        digits++;
+        hi = (hi << 4) | nibble;
     }
-
-    if (digits != 11 || *s != '\0') return false;
-    *out = value;
+    for (int i = 12; i < 28; i++) {
+        char c = p[i];
+        uint64_t nibble = 0;
+        if (c >= '0' && c <= '9') nibble = (uint64_t)(c - '0');
+        else if (c >= 'a' && c <= 'f') nibble = (uint64_t)(c - 'a' + 10);
+        else if (c >= 'A' && c <= 'F') nibble = (uint64_t)(c - 'A' + 10);
+        else return false;
+        lo = (lo << 4) | nibble;
+    }
+    out->lo = lo;
+    out->hi = hi;
     return true;
 }
 
@@ -606,14 +627,14 @@ public:
             return false;
         }
 
-        const char expected_magic[8] = {'M','K','E','Y','S','C','A','1'};
+        const char expected_magic[8] = {'B','T','C','T','A','1','1','2'};
         if (memcmp(magic, expected_magic, sizeof(magic)) != 0 || version != 1) {
             return false;
         }
 
         values.resize((size_t)count);
         if (count > 0) {
-            in.read(reinterpret_cast<char*>(values.data()), (std::streamsize)(count * sizeof(uint64_t)));
+            in.read(reinterpret_cast<char*>(values.data()), (std::streamsize)(count * sizeof(Tag80)));
             if (!in.good()) {
                 values.clear();
                 return false;
@@ -625,7 +646,7 @@ public:
             values.erase(std::unique(values.begin(), values.end()), values.end());
         }
 
-        printf("Loaded %zu mongo_keys from cache file: %s\n", values.size(), file_path);
+        printf("Loaded %zu btc tags (112-bit) from cache file: %s\n", values.size(), file_path);
         return !values.empty();
     }
 
@@ -637,18 +658,18 @@ public:
             return false;
         }
 
-        const char magic[8] = {'M','K','E','Y','S','C','A','1'};
+        const char magic[8] = {'B','T','C','T','A','1','1','2'};
         const uint64_t version = 1;
         const uint64_t count = (uint64_t)values.size();
         out.write(magic, sizeof(magic));
         out.write(reinterpret_cast<const char*>(&version), sizeof(version));
         out.write(reinterpret_cast<const char*>(&count), sizeof(count));
-        out.write(reinterpret_cast<const char*>(values.data()), (std::streamsize)(count * sizeof(uint64_t)));
+        out.write(reinterpret_cast<const char*>(values.data()), (std::streamsize)(count * sizeof(Tag80)));
         if (!out.good()) {
             return false;
         }
 
-        printf("Saved %zu mongo_keys to cache file: %s\n", values.size(), file_path);
+        printf("Saved %zu btc tags (112-bit) to cache file: %s\n", values.size(), file_path);
         return true;
     }
 
@@ -668,29 +689,32 @@ public:
         const bson_t *doc = nullptr;
 
         values.clear();
-        printf("Loading mongo_keys from MongoDB into local cache...\n");
+        printf("Loading btc _id tags (last 28 hex chars) from MongoDB into local cache...\n");
+        uint64_t load_count = 0;
         while (mongoc_cursor_next(cursor, &doc)) {
             bson_iter_t it;
-            const char *tag_str = nullptr;
-            uint32_t tag_len = 0;
+            const char *id_str = nullptr;
+            uint32_t id_len = 0;
 
             if (bson_iter_init_find(&it, doc, "_id") && BSON_ITER_HOLDS_UTF8(&it)) {
-                tag_str = bson_iter_utf8(&it, &tag_len);
-            } else if (bson_iter_init_find(&it, doc, "tag") && BSON_ITER_HOLDS_UTF8(&it)) {
-                tag_str = bson_iter_utf8(&it, &tag_len);
+                id_str = bson_iter_utf8(&it, &id_len);
             }
 
-            if (!tag_str || tag_len == 0) continue;
+            if (!id_str || id_len < 28) continue;
 
-            std::string s(tag_str, tag_len);
-            uint64_t tag = 0;
-            if (parse_hex44(&tag, s.c_str())) {
+            Tag80 tag;
+            if (parse_last28hex(&tag, id_str, id_len)) {
                 values.push_back(tag);
+                load_count++;
+                if (load_count % 1000000 == 0) {
+                    printf("\r  Loaded %llu M entries...", (unsigned long long)(load_count / 1000000));
+                    fflush(stdout);
+                }
             }
         }
 
         if (mongoc_cursor_error(cursor, nullptr)) {
-            fprintf(stderr, "MongoKeyCache: cursor error while loading mongo_keys\n");
+            fprintf(stderr, "MongoKeyCache: cursor error while loading btc tags\n");
             values.clear();
         }
 
@@ -702,15 +726,15 @@ public:
 
         std::sort(values.begin(), values.end());
         values.erase(std::unique(values.begin(), values.end()), values.end());
-        printf("\rLoaded %zu mongo_keys into local cache\n", values.size());
+        printf("\rLoaded %zu btc tags (112-bit) into local cache\n", values.size());
         return !values.empty();
     }
 
-    bool contains(uint64_t value) const {
+    bool contains(const Tag80 &value) const {
         return std::binary_search(values.begin(), values.end(), value);
     }
 
-    size_t containsBatch(const uint64_t *tags, uint8_t *hits, size_t n) const {
+    size_t containsBatch(const Tag80 *tags, uint8_t *hits, size_t n) const {
         if (!tags || !hits || n == 0 || values.empty()) return 0;
 
         size_t matched = 0;
@@ -726,7 +750,7 @@ public:
     }
 
 private:
-    std::vector<uint64_t> values;
+    std::vector<Tag80> values;
 };
 
 // ===========================================================================
@@ -893,7 +917,7 @@ void MongoMatchLogger(const char* mongo_uri) {
 class HybridScanner {
 public:
     const MongoKeyCache *local_cache = nullptr;
-    std::vector<uint64_t> local_tags;
+    std::vector<Tag80> local_tags;
     std::vector<uint8_t> local_hits;
 
     HybridScanner(const MongoKeyCache *cache) {
@@ -909,7 +933,11 @@ public:
         if ((int)local_hits.size() < n) local_hits.resize((size_t)n);
 
         for (int i = 0; i < n; i++) {
-            local_tags[(size_t)i] = rs_ptr[i * 4] & 0xFFFFFFFFFFFULL;
+            // 最後 28 hex chars = 最低 112 bits
+            // 前 12 hex (最高 48 bits) = hex 字串最左邊 = rs 數值最高位 = bits 64-111
+            // 後 16 hex (最低 64 bits) = hex 字串最右邊 = rs 數值最低位 = bits 0-63
+            local_tags[(size_t)i].lo = rs_ptr[i * 4];                         // bits 0-63
+            local_tags[(size_t)i].hi = rs_ptr[i * 4 + 1] & 0xFFFFFFFFFFFFULL; // bits 64-111 (低 48 bits)
         }
         local_cache->containsBatch(local_tags.data(), local_hits.data(), (size_t)n);
 
@@ -1001,7 +1029,7 @@ int main(int argc, char **argv) {
 
     bool local_cache_ready = mongo_key_cache.loadFromFile(cache_file);
     if (!local_cache_ready) {
-        local_cache_ready = mongo_key_cache.loadFromMongo("mongodb://127.0.0.1:27017", "ecdsa", "mongo_keys");
+        local_cache_ready = mongo_key_cache.loadFromMongo("mongodb://127.0.0.1:27017", "ecdsa", "btc");
         if (local_cache_ready) {
             if (!mongo_key_cache.saveToFile(cache_file)) {
                 fprintf(stderr, "Warning: failed to save local cache file: %s\n", cache_file);
