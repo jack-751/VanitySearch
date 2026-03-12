@@ -51,6 +51,7 @@ SCAN_WORKERS=2 MAX_PENDING_SCAN=8 ./CalcR_GPU 0
 #include <chrono>
 #include <algorithm>
 #include <fstream>
+#include <random>
 #include <mongoc/mongoc.h>
 #include <bson/bson.h>
 #include <ctime>
@@ -873,15 +874,7 @@ void MongoMatchLogger(const char* mongo_uri) {
             
             printf("               [PRECISE MATCH FOUND IN BG!] Inserted into match col for r=%s\n", rs.c_str());
         } else {
-            // Not a precise match. Remove from matched_candidates collection.
-            bson_t c_filter;
-            bson_init(&c_filter);
-            BSON_APPEND_UTF8(&c_filter, "r", rs.c_str());
-            BSON_APPEND_UTF8(&c_filter, "k", ks.c_str());
-            if (!mongoc_collection_delete_one(candidate_col, &c_filter, nullptr, nullptr, &error)) {
-                fprintf(stderr, "MongoDB Candidate Delete Error: %s\n", error.message);
-            }
-            bson_destroy(&c_filter);
+            // Not a precise match. Keep the candidate record for manual inspection.
         }
         
         mongoc_cursor_destroy(cursor);
@@ -1124,6 +1117,22 @@ int main(int argc, char **argv) {
     std::atomic<long long> total_keys(0);
     auto start_time = std::chrono::high_resolution_clock::now();
 
+    std::random_device rd;
+    std::seed_seq seed_seq{
+        rd(), rd(), rd(), rd(),
+        (unsigned)std::chrono::high_resolution_clock::now().time_since_epoch().count()
+    };
+    std::mt19937_64 rng(seed_seq);
+
+    auto randomize_k_start = [&]() {
+        do {
+            k_start[0] = rng();
+            k_start[1] = rng();
+            k_start[2] = rng();
+            k_start[3] = rng();
+        } while (k_start[0] == 0 && k_start[1] == 0 && k_start[2] == 0 && k_start[3] == 0);
+    };
+
     do {
         // Throttle producer when scan queue is too deep to keep memory bounded.
         while ((int)scan_queue.size() >= max_pending_scan) {
@@ -1167,13 +1176,8 @@ int main(int argc, char **argv) {
             last_print = current_time;
         }
 
-        // 遞增 k_start
-        uint64_t carry = (uint64_t)n;
-        for (int j = 0; j < 4; j++) {
-            uint64_t val = k_start[j];
-            k_start[j] = val + carry;
-            carry = (k_start[j] < val) ? 1 : 0;
-        }
+        // 第一批使用原始 k_start；後續每批改用隨機起點
+        randomize_k_start();
 
     } while (infinite);
 

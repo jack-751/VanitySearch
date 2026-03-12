@@ -15,3 +15,5 @@ VanitySearch
 cmake-build-debug/
 *.prf
 GPU/mongo_keys.cache.bin
+GPU/CalcR_GPU
+GPU/CalcR_GPU
