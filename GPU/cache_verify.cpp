@@ -1,13 +1,13 @@
 /*
  * cache_verify.cpp
  *
- * Verify BTCTA040 cache file integrity.
+ * Verify BTCTA048 cache file integrity.
  *
  * Build:
  *   g++ -O2 -std=c++17 -o cache_verify cache_verify.cpp
  *
  * Usage:
- *   ./cache_verify <cache_40bit.bin> [--full] [--sample N]
+ *   ./cache_verify <cache_48bit.bin> [--full] [--sample N]
  *
  * Modes:
  *   - default (quick): header/size checks + sampled order checks
@@ -23,12 +23,12 @@
 #include <chrono>
 #include <vector>
 
-struct Tag40 {
+struct Tag48 {
     uint32_t lo;
-    uint8_t hi;
+    uint16_t hi;
 } __attribute__((packed));
 
-static int compare_tag(const Tag40 &a, const Tag40 &b) {
+static int compare_tag(const Tag48 &a, const Tag48 &b) {
     if (a.hi < b.hi) return -1;
     if (a.hi > b.hi) return 1;
     if (a.lo < b.lo) return -1;
@@ -36,11 +36,11 @@ static int compare_tag(const Tag40 &a, const Tag40 &b) {
     return 0;
 }
 
-static bool read_tag_at(FILE *f, uint64_t index, Tag40 *out) {
+static bool read_tag_at(FILE *f, uint64_t index, Tag48 *out) {
     if (!f || !out) return false;
-    const uint64_t off = 16ULL + index * (uint64_t)sizeof(Tag40);
+    const uint64_t off = 16ULL + index * (uint64_t)sizeof(Tag48);
     if (fseek(f, (long)off, SEEK_SET) != 0) return false;
-    return fread(out, sizeof(Tag40), 1, f) == 1;
+    return fread(out, sizeof(Tag48), 1, f) == 1;
 }
 
 static bool parse_u64(const char *s, uint64_t *out) {
@@ -54,7 +54,7 @@ static bool parse_u64(const char *s, uint64_t *out) {
 
 int main(int argc, char **argv) {
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s <cache_40bit.bin> [--full] [--sample N]\n", argv[0]);
+        fprintf(stderr, "Usage: %s <cache_48bit.bin> [--full] [--sample N]\n", argv[0]);
         return 1;
     }
 
@@ -105,9 +105,9 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    const char expected_magic[8] = {'B','T','C','T','A','0','4','0'};
+    const char expected_magic[8] = {'B','T','C','T','A','0','4','8'};
     bool magic_ok = memcmp(magic, expected_magic, 8) == 0;
-    uint64_t expected_size = 16ULL + count * (uint64_t)sizeof(Tag40);
+    uint64_t expected_size = 16ULL + count * (uint64_t)sizeof(Tag48);
     bool size_ok = (file_size == expected_size);
 
     printf("File: %s\n", path);
@@ -132,7 +132,7 @@ int main(int argc, char **argv) {
 
     if (full) {
         printf("Mode: full scan\n");
-        Tag40 prev, cur;
+        Tag48 prev, cur;
         if (!read_tag_at(f, 0, &prev)) {
             fprintf(stderr, "Error: cannot read first tag\n");
             fclose(f);
@@ -182,7 +182,7 @@ int main(int argc, char **argv) {
         uint64_t head_n = sample_n;
         if (head_n > count - 1) head_n = count - 1;
 
-        Tag40 prev, cur;
+        Tag48 prev, cur;
         if (!read_tag_at(f, 0, &prev)) {
             fprintf(stderr, "Error: cannot read first tag\n");
             fclose(f);
@@ -247,7 +247,7 @@ int main(int argc, char **argv) {
 
             for (uint64_t k = 0; k < rand_checks; k++) {
                 uint64_t i = (rng() % (count - 1));
-                Tag40 a, b;
+                Tag48 a, b;
                 if (!read_tag_at(f, i, &a) || !read_tag_at(f, i + 1, &b)) {
                     fprintf(stderr, "Error: random check read failed at index %llu\n", (unsigned long long)i);
                     fclose(f);

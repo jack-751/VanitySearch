@@ -569,7 +569,7 @@ static std::string hex256(const uint64_t v[4]) {
 // 40-bit tag: lo = lower 32 bits (bits 0-31), hi = upper 8 bits (bits 32-39)
 struct Tag72 {
     uint32_t lo;
-    uint8_t  hi;
+    uint16_t hi;
     bool operator<(const Tag72 &o) const {
         if (hi != o.hi) return hi < o.hi;
         return lo < o.lo;
@@ -579,23 +579,23 @@ struct Tag72 {
     }
 } __attribute__((packed));
 
-// 解析字串最後 10 個 hex 字元為 Tag72 (40 bits)
-// hi = 前 2 hex (8 bits), lo = 後 8 hex (32 bits)
-static bool parse_last10hex(Tag72 *out, const char *s, uint32_t len) {
-    if (!out || !s || len < 10) return false;
-    const char *p = s + len - 10;
-    uint8_t  hi = 0;
+// 解析字串最後 12 個 hex 字元為 Tag72 (48 bits)
+// hi = 前 4 hex (16 bits), lo = 後 8 hex (32 bits)
+static bool parse_last12hex(Tag72 *out, const char *s, uint32_t len) {
+    if (!out || !s || len < 12) return false;
+    const char *p = s + len - 12;
+    uint16_t hi = 0;
     uint32_t lo = 0;
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < 4; i++) {
         char c = p[i];
         uint8_t nibble = 0;
         if (c >= '0' && c <= '9') nibble = (uint8_t)(c - '0');
         else if (c >= 'a' && c <= 'f') nibble = (uint8_t)(c - 'a' + 10);
         else if (c >= 'A' && c <= 'F') nibble = (uint8_t)(c - 'A' + 10);
         else return false;
-        hi = (uint8_t)((hi << 4) | nibble);
+        hi = (uint16_t)((hi << 4) | nibble);
     }
-    for (int i = 2; i < 10; i++) {
+    for (int i = 4; i < 12; i++) {
         char c = p[i];
         uint32_t nibble = 0;
         if (c >= '0' && c <= '9') nibble = (uint32_t)(c - '0');
@@ -636,7 +636,7 @@ public:
             return false;
         }
 
-        const char expected_magic[8] = {'B','T','C','T','A','0','4','0'};
+        const char expected_magic[8] = {'B','T','C','T','A','0','4','8'};
         if (memcmp(magic, expected_magic, sizeof(magic)) != 0) {
             fprintf(stderr,
                     "MongoKeyCache: unsupported cache magic in %s (got=%.8s expected=BTCTA040)\n",
@@ -755,10 +755,10 @@ public:
                 id_str = bson_iter_utf8(&it, &id_len);
             }
 
-            if (!id_str || id_len < 10) continue;
+            if (!id_str || id_len < 12) continue;
 
             Tag72 tag;
-            if (parse_last10hex(&tag, id_str, id_len)) {
+            if (parse_last12hex(&tag, id_str, id_len)) {
                 values.push_back(tag);
                 load_count++;
                 if (load_count % 1000000 == 0) {
@@ -988,11 +988,11 @@ public:
         if ((int)local_hits.size() < n) local_hits.resize((size_t)n);
 
         for (int i = 0; i < n; i++) {
-            // 最後 10 hex chars = 最低 40 bits
-            // 前 2 hex (最高 8 bits)  = rs 數值 bits 32-39
+            // 最後 12 hex chars = 最低 48 bits
+            // 前 4 hex (最高 16 bits) = rs 數值 bits 32-47
             // 後 8 hex (最低 32 bits) = rs 數值 bits 0-31
-            local_tags[(size_t)i].lo = (uint32_t)(rs_ptr[i * 4] & 0xFFFFFFFFULL);        // bits 0-31
-            local_tags[(size_t)i].hi = (uint8_t)((rs_ptr[i * 4] >> 32) & 0xFFULL);        // bits 32-39
+            local_tags[(size_t)i].lo = (uint32_t)(rs_ptr[i * 4] & 0xFFFFFFFFULL);         // bits 0-31
+            local_tags[(size_t)i].hi = (uint16_t)((rs_ptr[i * 4] >> 32) & 0xFFFFULL);     // bits 32-47
         }
         local_cache->containsBatch(local_tags.data(), local_hits.data(), (size_t)n);
 

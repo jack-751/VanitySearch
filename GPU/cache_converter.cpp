@@ -1,8 +1,8 @@
 /*
  * cache_converter.cpp
  *
- * 將 96-bit 快取 (BTCTA096 format) 轉換為 40-bit 快取 (BTCTA040 format)
- * 提取最後 10 hex 字元（而不是 24 個）
+ * 將 96-bit 快取 (BTCTA096 format) 轉換為 48-bit 快取 (BTCTA048 format)
+ * 提取最後 12 hex 字元（而不是 24 個）
  *
  * 編譯：
  *   g++ -O2 -std=c++17 -o cache_converter cache_converter.cpp
@@ -29,10 +29,17 @@ struct Tag96 {
     uint64_t lo;
 } __attribute__((packed));
 
-// 40-bit tag (new format): uint8_t hi (8 bits) + uint32_t lo (32 bits)
-struct Tag40 {
+// 48-bit tag (new format): uint16_t hi (16 bits, bits 32-47) + uint32_t lo (32 bits, bits 0-31)
+struct Tag48 {
     uint32_t lo;
-    uint8_t  hi;
+    uint16_t hi;
+} __attribute__((packed));
+
+// Bucket entry stores lower 40 bits: lo (bits 0-31) + mid (bits 32-39)
+// The upper 8 bits (bits 40-47) are encoded as the bucket index.
+struct BucketEntry48 {
+    uint32_t lo;
+    uint8_t  mid;
 } __attribute__((packed));
 
 static bool read_exact(FILE *f, void *buf, size_t elem_size, size_t count) {
@@ -65,10 +72,12 @@ static std::string run_path(const std::string &prefix, int hi, size_t run_idx) {
 }
 
 struct MergeNode {
-    uint32_t value;
+    uint32_t lo;
+    uint8_t  mid;
     size_t run_idx;
     bool operator>(const MergeNode &o) const {
-        if (value != o.value) return value > o.value;
+        if (mid != o.mid) return mid > o.mid;
+        if (lo != o.lo) return lo > o.lo;
         return run_idx > o.run_idx;
     }
 };
@@ -109,16 +118,19 @@ static bool process_single_bucket(
     }
 
     const size_t CHUNK_ELEMS = 8ULL * 1024ULL * 1024ULL;
-    std::vector<uint32_t> chunk;
+    std::vector<BucketEntry48> chunk;
     chunk.resize(CHUNK_ELEMS);
 
     std::vector<std::string> runs;
     size_t run_idx = 0;
     while (true) {
-        size_t got = fread(chunk.data(), sizeof(uint32_t), CHUNK_ELEMS, in);
+        size_t got = fread(chunk.data(), sizeof(BucketEntry48), CHUNK_ELEMS, in);
         if (got == 0) break;
 
-        std::sort(chunk.begin(), chunk.begin() + got);
+        std::sort(chunk.begin(), chunk.begin() + got, [](const BucketEntry48 &a, const BucketEntry48 &b) {
+            if (a.mid != b.mid) return a.mid < b.mid;
+            return a.lo < b.lo;
+        });
         std::string rp = run_path(tmp_prefix, hi, run_idx++);
         FILE *rf = fopen(rp.c_str(), "wb");
         if (!rf) {
@@ -126,7 +138,7 @@ static bool process_single_bucket(
             fclose(in);
             return false;
         }
-        if (!write_exact(rf, chunk.data(), sizeof(uint32_t), got)) {
+        if (!write_exact(rf, chunk.data(), sizeof(BucketEntry48), got)) {
             fprintf(stderr, "Error: write run failed: %s\n", rp.c_str());
             fclose(rf);
             fclose(in);
@@ -147,23 +159,24 @@ static bool process_single_bucket(
             fprintf(stderr, "Error: cannot open run file for merge: %s\n", runs[i].c_str());
             return false;
         }
-        uint32_t v;
+        BucketEntry48 v;
         if (read_exact(readers[i].f, &v, sizeof(v), 1)) {
-            pq.push(MergeNode{v, i});
+            pq.push(MergeNode{v.lo, v.mid, i});
         }
     }
 
     bool has_last = false;
-    uint32_t last = 0;
-    Tag40 out_tag{};
-    out_tag.hi = (uint8_t)hi;
+    uint32_t last_lo = 0;
+    uint8_t  last_mid = 0;
+    Tag48 out_tag{};
 
     while (!pq.empty()) {
         MergeNode cur = pq.top();
         pq.pop();
 
-        if (!has_last || cur.value != last) {
-            out_tag.lo = cur.value;
+        if (!has_last || cur.lo != last_lo || cur.mid != last_mid) {
+            out_tag.lo = cur.lo;
+            out_tag.hi = (uint16_t)(((uint16_t)hi << 8) | cur.mid);
             if (!write_exact(out, &out_tag, sizeof(out_tag), 1)) {
                 fprintf(stderr, "Error: write output tag failed (hi=%d)\n", hi);
                 for (size_t j = 0; j < readers.size(); j++) {
@@ -172,13 +185,14 @@ static bool process_single_bucket(
                 return false;
             }
             (*out_count)++;
-            last = cur.value;
+            last_lo = cur.lo;
+            last_mid = cur.mid;
             has_last = true;
         }
 
-        uint32_t next_v;
+        BucketEntry48 next_v;
         if (read_exact(readers[cur.run_idx].f, &next_v, sizeof(next_v), 1)) {
-            pq.push(MergeNode{next_v, cur.run_idx});
+            pq.push(MergeNode{next_v.lo, next_v.mid, cur.run_idx});
         }
     }
 
@@ -192,14 +206,14 @@ static bool process_single_bucket(
 
 int main(int argc, char **argv) {
     if (argc != 3) {
-        fprintf(stderr, "Usage: %s <input_96bit.bin> <output_40bit.bin>\n", argv[0]);
+        fprintf(stderr, "Usage: %s <input_96bit.bin> <output_48bit.bin>\n", argv[0]);
         return 1;
     }
 
     const char *input_file = argv[1];
     const char *output_file = argv[2];
 
-    printf("Converting cache from 96-bit to 40-bit...\n");
+    printf("Converting cache from 96-bit to 48-bit...\n");
     printf("Input:  %s\n", input_file);
     printf("Output: %s\n", output_file);
 
@@ -276,10 +290,12 @@ int main(int argc, char **argv) {
         }
 
         for (size_t i = 0; i < read_count; i++) {
-            uint8_t hi = (uint8_t)((in_batch[i].lo >> 32) & 0xFFULL);
-            uint32_t lo = (uint32_t)(in_batch[i].lo & 0xFFFFFFFFULL);
-            if (!write_exact(bucket_fp[hi], &lo, sizeof(lo), 1)) {
-                fprintf(stderr, "Error: write bucket failed (hi=%u)\n", (unsigned int)hi);
+            uint8_t  bucket_hi = (uint8_t)((in_batch[i].lo >> 40) & 0xFFULL);  // bits 40-47
+            BucketEntry48 entry;
+            entry.lo  = (uint32_t)(in_batch[i].lo & 0xFFFFFFFFULL);             // bits 0-31
+            entry.mid = (uint8_t)((in_batch[i].lo >> 32) & 0xFFULL);            // bits 32-39
+            if (!write_exact(bucket_fp[bucket_hi], &entry, sizeof(entry), 1)) {
+                fprintf(stderr, "Error: write bucket failed (bucket_hi=%u)\n", (unsigned int)bucket_hi);
                 fclose(in);
                 return 1;
             }
@@ -317,7 +333,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    const char out_magic[8] = {'B', 'T', 'C', 'T', 'A', '0', '4', '0'};
+    const char out_magic[8] = {'B', 'T', 'C', 'T', 'A', '0', '4', '8'};
     uint64_t final_count = 0;
     if (!write_exact(out, out_magic, 1, 8) || !write_exact(out, &final_count, sizeof(final_count), 1)) {
         fprintf(stderr, "Error: cannot write output header\n");
@@ -326,8 +342,10 @@ int main(int argc, char **argv) {
     }
 
     for (int hi = 0; hi < 256; hi++) {
-        printf("Sorting+dedup bucket %d/255...\n", hi);
-        fflush(stdout);
+        if (hi % 32 == 0 || hi == 255) {
+            printf("Sorting+dedup bucket %d/255...\n", hi);
+            fflush(stdout);
+        }
         if (!process_single_bucket(bucket_files[hi], tmp_prefix, hi, out, &final_count)) {
             fclose(out);
             return 1;
@@ -366,9 +384,9 @@ int main(int argc, char **argv) {
 
     printf("Output magic:  %.8s\n", verify_magic);
     printf("Output count:  %llu\n", (unsigned long long)verify_count);
-        printf("Output format: 40-bit (10 hex chars per tag)\n");
+    printf("Output format: 48-bit (12 hex chars per tag)\n");
     printf("Output file size: ~%llu bytes\n",
-           (unsigned long long)(16 + verify_count * sizeof(Tag40)));
+           (unsigned long long)(16 + verify_count * sizeof(Tag48)));
 
     return 0;
 }
