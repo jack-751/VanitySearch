@@ -30,8 +30,9 @@ SCAN_WORKERS=2 MAX_PENDING_SCAN=8 ./CalcR_GPU 0
 如果 RAM 還高，降成 MAX_PENDING_SCAN=4
 如果 GPU 利用率掉太多，再慢慢加回 MAX_PENDING_SCAN
 
- SCAN_WORKERS=2 MAX_PENDING_SCAN=2 ./CalcR_GPU 0 0x3e4c0d2798be2c0b4da595e082a707335bf812abeda97c750d72718728a3d6c
-*/
+ SCAN_WORKERS=2 MAX_PENDING_SCAN=2 MONGO_KEYS_CACHE_FILE=mongo_keys.cache.bin ./CalcR_GPU 0 0x3e4c0d2798be2c0b4da595e082a707335bf812abeda97c750d72718728a3d6c
+ SCAN_WORKERS=2 MAX_PENDING_SCAN=2 MONGO_KEYS_CACHE_FILE=mongo_keys.cache.bin ./CalcR_GPU 1000 0x01
+ */
 
  
 #include <cstdio>
@@ -613,36 +614,93 @@ public:
     bool loadFromFile(const char *file_path) {
         if (!file_path || file_path[0] == '\0') return false;
 
+        printf("Trying local cache file: %s\n", file_path);
+        fflush(stdout);
+
         std::ifstream in(file_path, std::ios::binary);
         if (!in.is_open()) {
+            fprintf(stderr, "MongoKeyCache: cannot open cache file: %s\n", file_path);
             return false;
         }
+
+        in.seekg(0, std::ios::end);
+        std::streamoff file_size = in.tellg();
+        in.seekg(0, std::ios::beg);
 
         char magic[8] = {0};
         uint64_t count = 0;
         in.read(magic, sizeof(magic));
         in.read(reinterpret_cast<char*>(&count), sizeof(count));
         if (!in.good()) {
+            fprintf(stderr, "MongoKeyCache: failed to read cache header from: %s\n", file_path);
             return false;
         }
 
         const char expected_magic[8] = {'B','T','C','T','A','0','4','0'};
         if (memcmp(magic, expected_magic, sizeof(magic)) != 0) {
+            fprintf(stderr,
+                    "MongoKeyCache: unsupported cache magic in %s (got=%.8s expected=BTCTA040)\n",
+                    file_path, magic);
             return false;
         }
 
-        values.resize((size_t)count);
+        const uint64_t expected_payload = count * (uint64_t)sizeof(Tag72);
+        const uint64_t expected_total = expected_payload + 16ULL;
+        if (file_size >= 0 && (uint64_t)file_size != expected_total) {
+            fprintf(stderr,
+                    "MongoKeyCache: cache size mismatch in %s (actual=%llu expected=%llu)\n",
+                    file_path,
+                    (unsigned long long)file_size,
+                    (unsigned long long)expected_total);
+            return false;
+        }
+
+        printf("Cache header OK: entries=%llu, payload=%.2f GiB\n",
+               (unsigned long long)count,
+               (double)expected_payload / (1024.0 * 1024.0 * 1024.0));
+        printf("Reading cache payload...\n");
+        fflush(stdout);
+
+        try {
+            values.resize((size_t)count);
+        } catch (const std::bad_alloc &) {
+            fprintf(stderr,
+                    "MongoKeyCache: not enough RAM to allocate %llu entries from cache file: %s\n",
+                    (unsigned long long)count,
+                    file_path);
+            values.clear();
+            return false;
+        }
+
         if (count > 0) {
             in.read(reinterpret_cast<char*>(values.data()), (std::streamsize)(count * sizeof(Tag72)));
             if (!in.good()) {
+                fprintf(stderr, "MongoKeyCache: failed while reading cache payload from: %s\n", file_path);
                 values.clear();
                 return false;
             }
         }
 
-        if (!std::is_sorted(values.begin(), values.end())) {
-            std::sort(values.begin(), values.end());
-            values.erase(std::unique(values.begin(), values.end()), values.end());
+        printf("Cache payload read complete.\n");
+        fflush(stdout);
+
+        bool verify_sorted = false;
+        const char *verify_env = getenv("VERIFY_CACHE_SORTED");
+        if (verify_env && verify_env[0] != '\0') {
+            verify_sorted = atoi(verify_env) != 0;
+        }
+
+        if (verify_sorted) {
+            printf("Verifying cache sort order (VERIFY_CACHE_SORTED=1)...\n");
+            fflush(stdout);
+            if (!std::is_sorted(values.begin(), values.end())) {
+                printf("Cache is not sorted; sorting + deduplicating...\n");
+                fflush(stdout);
+                std::sort(values.begin(), values.end());
+                values.erase(std::unique(values.begin(), values.end()), values.end());
+            }
+        } else {
+            printf("Skip sorted-check for fast startup (set VERIFY_CACHE_SORTED=1 to force check).\n");
         }
 
         printf("Loaded %zu btc tags (40-bit) from cache file: %s\n", values.size(), file_path);
@@ -1023,9 +1081,13 @@ int main(int argc, char **argv) {
     MongoKeyCache mongo_key_cache;
     const char *cache_file_env = getenv("MONGO_KEYS_CACHE_FILE");
     const char *cache_file = (cache_file_env && cache_file_env[0]) ? cache_file_env : "mongo_keys.cache.bin";
+    printf("MONGO_KEYS_CACHE_FILE=%s\n", cache_file);
+    fflush(stdout);
 
     bool local_cache_ready = mongo_key_cache.loadFromFile(cache_file);
     if (!local_cache_ready) {
+        printf("Local cache load failed; fallback to MongoDB scan...\n");
+        fflush(stdout);
         local_cache_ready = mongo_key_cache.loadFromMongo("mongodb://127.0.0.1:27017", "ecdsa", "btc");
         if (local_cache_ready) {
             if (!mongo_key_cache.saveToFile(cache_file)) {
