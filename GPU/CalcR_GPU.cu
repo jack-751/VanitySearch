@@ -565,40 +565,41 @@ static std::string hex256(const uint64_t v[4]) {
     return std::string(buf);
 }
 
-// 112-bit tag: lo = lower 64 bits (bits 0-63), hi = upper 48 bits (bits 64-111)
-struct Tag80 {
-    uint64_t lo;
-    uint64_t hi;  // only bits 0-47 used
-    bool operator<(const Tag80 &o) const {
+// 40-bit tag: lo = lower 32 bits (bits 0-31), hi = upper 8 bits (bits 32-39)
+struct Tag72 {
+    uint32_t lo;
+    uint8_t  hi;
+    bool operator<(const Tag72 &o) const {
         if (hi != o.hi) return hi < o.hi;
         return lo < o.lo;
     }
-    bool operator==(const Tag80 &o) const {
+    bool operator==(const Tag72 &o) const {
         return lo == o.lo && hi == o.hi;
     }
-};
+} __attribute__((packed));
 
-// 解析字串最後 28 個 hex 字元為 Tag80 (112 bits)
-// hi = 前 12 hex (48 bits), lo = 後 16 hex (64 bits)
-static bool parse_last28hex(Tag80 *out, const char *s, uint32_t len) {
-    if (!out || !s || len < 28) return false;
-    const char *p = s + len - 28;
-    uint64_t hi = 0, lo = 0;
-    for (int i = 0; i < 12; i++) {
+// 解析字串最後 10 個 hex 字元為 Tag72 (40 bits)
+// hi = 前 2 hex (8 bits), lo = 後 8 hex (32 bits)
+static bool parse_last10hex(Tag72 *out, const char *s, uint32_t len) {
+    if (!out || !s || len < 10) return false;
+    const char *p = s + len - 10;
+    uint8_t  hi = 0;
+    uint32_t lo = 0;
+    for (int i = 0; i < 2; i++) {
         char c = p[i];
-        uint64_t nibble = 0;
-        if (c >= '0' && c <= '9') nibble = (uint64_t)(c - '0');
-        else if (c >= 'a' && c <= 'f') nibble = (uint64_t)(c - 'a' + 10);
-        else if (c >= 'A' && c <= 'F') nibble = (uint64_t)(c - 'A' + 10);
+        uint8_t nibble = 0;
+        if (c >= '0' && c <= '9') nibble = (uint8_t)(c - '0');
+        else if (c >= 'a' && c <= 'f') nibble = (uint8_t)(c - 'a' + 10);
+        else if (c >= 'A' && c <= 'F') nibble = (uint8_t)(c - 'A' + 10);
         else return false;
-        hi = (hi << 4) | nibble;
+        hi = (uint8_t)((hi << 4) | nibble);
     }
-    for (int i = 12; i < 28; i++) {
+    for (int i = 2; i < 10; i++) {
         char c = p[i];
-        uint64_t nibble = 0;
-        if (c >= '0' && c <= '9') nibble = (uint64_t)(c - '0');
-        else if (c >= 'a' && c <= 'f') nibble = (uint64_t)(c - 'a' + 10);
-        else if (c >= 'A' && c <= 'F') nibble = (uint64_t)(c - 'A' + 10);
+        uint32_t nibble = 0;
+        if (c >= '0' && c <= '9') nibble = (uint32_t)(c - '0');
+        else if (c >= 'a' && c <= 'f') nibble = (uint32_t)(c - 'a' + 10);
+        else if (c >= 'A' && c <= 'F') nibble = (uint32_t)(c - 'A' + 10);
         else return false;
         lo = (lo << 4) | nibble;
     }
@@ -618,23 +619,21 @@ public:
         }
 
         char magic[8] = {0};
-        uint64_t version = 0;
         uint64_t count = 0;
         in.read(magic, sizeof(magic));
-        in.read(reinterpret_cast<char*>(&version), sizeof(version));
         in.read(reinterpret_cast<char*>(&count), sizeof(count));
         if (!in.good()) {
             return false;
         }
 
-        const char expected_magic[8] = {'B','T','C','T','A','1','1','2'};
-        if (memcmp(magic, expected_magic, sizeof(magic)) != 0 || version != 1) {
+        const char expected_magic[8] = {'B','T','C','T','A','0','4','0'};
+        if (memcmp(magic, expected_magic, sizeof(magic)) != 0) {
             return false;
         }
 
         values.resize((size_t)count);
         if (count > 0) {
-            in.read(reinterpret_cast<char*>(values.data()), (std::streamsize)(count * sizeof(Tag80)));
+            in.read(reinterpret_cast<char*>(values.data()), (std::streamsize)(count * sizeof(Tag72)));
             if (!in.good()) {
                 values.clear();
                 return false;
@@ -646,7 +645,7 @@ public:
             values.erase(std::unique(values.begin(), values.end()), values.end());
         }
 
-        printf("Loaded %zu btc tags (112-bit) from cache file: %s\n", values.size(), file_path);
+        printf("Loaded %zu btc tags (40-bit) from cache file: %s\n", values.size(), file_path);
         return !values.empty();
     }
 
@@ -658,18 +657,16 @@ public:
             return false;
         }
 
-        const char magic[8] = {'B','T','C','T','A','1','1','2'};
-        const uint64_t version = 1;
+        const char magic[8] = {'B','T','C','T','A','0','4','0'};
         const uint64_t count = (uint64_t)values.size();
         out.write(magic, sizeof(magic));
-        out.write(reinterpret_cast<const char*>(&version), sizeof(version));
         out.write(reinterpret_cast<const char*>(&count), sizeof(count));
-        out.write(reinterpret_cast<const char*>(values.data()), (std::streamsize)(count * sizeof(Tag80)));
+        out.write(reinterpret_cast<const char*>(values.data()), (std::streamsize)(count * sizeof(Tag72)));
         if (!out.good()) {
             return false;
         }
 
-        printf("Saved %zu btc tags (112-bit) to cache file: %s\n", values.size(), file_path);
+        printf("Saved %zu btc tags (40-bit) to cache file: %s\n", values.size(), file_path);
         return true;
     }
 
@@ -689,21 +686,21 @@ public:
         const bson_t *doc = nullptr;
 
         values.clear();
-        printf("Loading btc _id tags (last 28 hex chars) from MongoDB into local cache...\n");
+        printf("Loading btc r tags (last 10 hex chars) from MongoDB into local cache...\n");
         uint64_t load_count = 0;
         while (mongoc_cursor_next(cursor, &doc)) {
             bson_iter_t it;
             const char *id_str = nullptr;
             uint32_t id_len = 0;
 
-            if (bson_iter_init_find(&it, doc, "_id") && BSON_ITER_HOLDS_UTF8(&it)) {
+            if (bson_iter_init_find(&it, doc, "r") && BSON_ITER_HOLDS_UTF8(&it)) {
                 id_str = bson_iter_utf8(&it, &id_len);
             }
 
-            if (!id_str || id_len < 28) continue;
+            if (!id_str || id_len < 10) continue;
 
-            Tag80 tag;
-            if (parse_last28hex(&tag, id_str, id_len)) {
+            Tag72 tag;
+            if (parse_last10hex(&tag, id_str, id_len)) {
                 values.push_back(tag);
                 load_count++;
                 if (load_count % 1000000 == 0) {
@@ -726,15 +723,15 @@ public:
 
         std::sort(values.begin(), values.end());
         values.erase(std::unique(values.begin(), values.end()), values.end());
-        printf("\rLoaded %zu btc tags (112-bit) into local cache\n", values.size());
+        printf("\rLoaded %zu btc tags (40-bit) into local cache\n", values.size());
         return !values.empty();
     }
 
-    bool contains(const Tag80 &value) const {
+    bool contains(const Tag72 &value) const {
         return std::binary_search(values.begin(), values.end(), value);
     }
 
-    size_t containsBatch(const Tag80 *tags, uint8_t *hits, size_t n) const {
+    size_t containsBatch(const Tag72 *tags, uint8_t *hits, size_t n) const {
         if (!tags || !hits || n == 0 || values.empty()) return 0;
 
         size_t matched = 0;
@@ -750,7 +747,7 @@ public:
     }
 
 private:
-    std::vector<Tag80> values;
+    std::vector<Tag72> values;
 };
 
 // ===========================================================================
@@ -849,10 +846,10 @@ void MongoMatchLogger(const char* mongo_uri) {
         std::string r0 = "0" + rs;
         std::string r00 = "00" + rs;
 
-        // Query using $in: { "_id": { "$in": [rs, r0, r00] } }
+        // Query using $in: { "r": { "$in": [rs, r0, r00] } }
         bson_t *query = bson_new();
         bson_t in_child;
-        BSON_APPEND_DOCUMENT_BEGIN(query, "_id", &in_child);
+        BSON_APPEND_DOCUMENT_BEGIN(query, "r", &in_child);
         bson_t in_array;
         BSON_APPEND_ARRAY_BEGIN(&in_child, "$in", &in_array);
         BSON_APPEND_UTF8(&in_array, "0", rs.c_str());
@@ -917,7 +914,7 @@ void MongoMatchLogger(const char* mongo_uri) {
 class HybridScanner {
 public:
     const MongoKeyCache *local_cache = nullptr;
-    std::vector<Tag80> local_tags;
+    std::vector<Tag72> local_tags;
     std::vector<uint8_t> local_hits;
 
     HybridScanner(const MongoKeyCache *cache) {
@@ -933,11 +930,11 @@ public:
         if ((int)local_hits.size() < n) local_hits.resize((size_t)n);
 
         for (int i = 0; i < n; i++) {
-            // 最後 28 hex chars = 最低 112 bits
-            // 前 12 hex (最高 48 bits) = hex 字串最左邊 = rs 數值最高位 = bits 64-111
-            // 後 16 hex (最低 64 bits) = hex 字串最右邊 = rs 數值最低位 = bits 0-63
-            local_tags[(size_t)i].lo = rs_ptr[i * 4];                         // bits 0-63
-            local_tags[(size_t)i].hi = rs_ptr[i * 4 + 1] & 0xFFFFFFFFFFFFULL; // bits 64-111 (低 48 bits)
+            // 最後 10 hex chars = 最低 40 bits
+            // 前 2 hex (最高 8 bits)  = rs 數值 bits 32-39
+            // 後 8 hex (最低 32 bits) = rs 數值 bits 0-31
+            local_tags[(size_t)i].lo = (uint32_t)(rs_ptr[i * 4] & 0xFFFFFFFFULL);        // bits 0-31
+            local_tags[(size_t)i].hi = (uint8_t)((rs_ptr[i * 4] >> 32) & 0xFFULL);        // bits 32-39
         }
         local_cache->containsBatch(local_tags.data(), local_hits.data(), (size_t)n);
 
