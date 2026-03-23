@@ -1,37 +1,35 @@
 /*
  * CalcR_GPU.cu
  *
- * CPU 產生 k 值 → GPU 計算 r = x(k·G) mod n (secp256k1 ECDSA)
+ * CPU 產生 k 值，GPU 計算 secp256k1 的 r = x(k·G) mod n。
  *
  * 策略：
  *   ① 每個 CUDA thread 負責一個 k 值。
- *   ② 純量乘法採用「雙倍加法 (double-and-add)」256-bit 二進位展開。
- *   ③ 所有模數運算直接複用 VanitySearch 的 GPUMath.h 核心
- *      (_ModMult, _ModSqr, _ModInv) — 已是目前最快的 PTX 實作。
- *   ④ 當批次夠大時，可改用 Montgomery Batch Inverse 進一步提速，
- *      但 double-and-add 本身每步需要不同的 inv，所以這裡的最優策略
- *      是 Jacobian 座標（避免每步求逆），最後統一轉回仿射座標時做一次
- *      Batch Inverse。本程式以此方式實作。
+ *   ② scalar multiplication 採用 Jacobian 座標下的 double-and-add，
+ *      讓點加法與倍點全程避免每步做 modular inversion。
+ *   ③ 所有模數運算複用 VanitySearch 的 GPUMath.h 核心
+ *      (_ModMult, _ModSqr, _ModInv)。
+ *   ④ 最後由 Jacobian Z 還原 affine x 時，現階段採用 per-thread
+ *      inversion 的正確性優先版本；若後續要再追吞吐量，再重做
+ *      正確的 batch inversion 版本。
  *
- * Jacobian 座標 (X:Y:Z) 對應仿射 (x, y) = (X/Z², Y/Z³)
+ * Jacobian 座標 (X:Y:Z) 對應仿射 (x, y) = (X/Z^2, Y/Z^3)
  *   點加法 / 點倍增全程無需 ModInv。
  *   最後 Z != 0 時，x_affine = X * Z^{-2} mod P。
- *   最多只需 (n_keys/BATCH) 次 Batch Inverse，效率極高。
  *
- * 編譯 (在 /workspace 目錄下)：
+ * 編譯：
  *   nvcc -O2 -arch=sm_86 -I. CalcR_GPU.cu -o CalcR_GPU $(pkg-config --cflags --libs libmongoc-1.0)
- *   (sm_86 = RTX 3xxx/Ada；依卡型調整)
  *
  * 執行：
- *   ./CalcR_GPU [count] [k_start]  # count: 要計算的 k 值數量，預設 16
- *                                  # k_start: 起始 k 值，預設 1（可為大整數）
-
-SCAN_WORKERS=2 MAX_PENDING_SCAN=8 ./CalcR_GPU 0
-如果 RAM 還高，降成 MAX_PENDING_SCAN=4
-如果 GPU 利用率掉太多，再慢慢加回 MAX_PENDING_SCAN
-
- SCAN_WORKERS=2 MAX_PENDING_SCAN=2 MONGO_KEYS_CACHE_FILE=mongo_keys.cache.bin ./CalcR_GPU 0 0x3e4c0d2798be2c0b4da595e082a707335bf812abeda97c750d72718728a3d6c
- SCAN_WORKERS=2 MAX_PENDING_SCAN=2 MONGO_KEYS_CACHE_FILE=mongo_keys.cache.bin ./CalcR_GPU 1000 0x01
+ *   ./CalcR_GPU [count] [k_start]
+ *
+ * 已驗證測試向量：
+ *   k = 22860751503568827944108675187057424959908371263446804931816731781078483855304
+ * (22860751503568827944108675187057424959908371263446804931816731781078483855304)10 = (0X328ABA10DD1E344A132F2818677E2D0318E14A7B6A307F426A94F8114701E7C8)16
+ *   r = 0xc0199ab7191cd18ccea7e4e9a4fd8ee4a970b7cbb48b8077190f5f69ebfe57d2
+ * 
+ * MONGO_URI=mongodb://127.0.0.1:27017 MONGO_DB=ecdsa MONGO_CANDIDATE_COLLECTION=matched_candidates MONGO_KEYS_CACHE_FILE=mongo_keys_16.cache.bin CACHE_HEX_LEN=16 SCAN_WORKERS=1 MAX_PENDING_SCAN=8 MAX_PENDING_MATCH=20000 ./CalcR_GPU 0 1
+ * 
  */
 
  
@@ -56,6 +54,7 @@ SCAN_WORKERS=2 MAX_PENDING_SCAN=8 ./CalcR_GPU 0
 #include <mongoc/mongoc.h>
 #include <bson/bson.h>
 #include <ctime>
+#include "BlockedBloom.h"
 
 // ===========================================================================
 // 引入 VanitySearch 的 GPU 數學庫
@@ -116,6 +115,10 @@ __device__ __forceinline__ void FullReduceP(uint64_t r[4]) {
     }
 }
 
+ 
+     已驗證測試向量：
+         k = 22860751503568827944108675187057424959908371263446804931816731781078483855304
+         r = 0xc0199ab7191cd18ccea7e4e9a4fd8ee4a970b7cbb48b8077190f5f69ebfe57d2
 // ModAdd: r = (a + b) mod P
 // 利用 ModSub256(a, ModNeg256(b)) 實現： a - (P - b) = a + b - P (若借位則 +P 得 a+b)
 __device__ __forceinline__ void ModAddP(uint64_t r[4], const uint64_t a[4], const uint64_t b[4]) {
@@ -319,18 +322,13 @@ __device__ void ScalarMultG_Jacobian(
 }
 
 // ===========================================================================
-// Batch Z-inversion + 轉回仿射座標 x，再對 n 取模得 r
+// Jacobian Z 轉回 affine x，再對 n 取模得 r
 // 輸入：Zs[n][5] (5-limb，Z 在 Jacobian 座標)
-//       Xs[n][4], Ys[n][4]
+//       Xs[n][4]
 // 輸出：rs[n][4] = (X/Z^2) mod n
 //
-// Montgomery batch inverse 算法：
-//   forward pass:  prefix[i] = Z[0]*Z[1]*...*Z[i]
-//   one ModInv:    inv = prefix[n-1]^{-1}
-//   backward pass: inv_Zi = inv * prefix[i-1]; inv = inv * Z[i]
-// ===========================================================================
-// ===========================================================================
-// 並行轉換 Kernel：每個 thread 獨立執行求逆以最大化 Warp 調度效率
+// 目前採用每個 thread 各自做一次 ModInv 的正確性優先版本。
+// 若後續需要更高吞吐量，可在確保正確性的前提下重新引入 batch inverse。
 // ===========================================================================
 __global__ void ParallelConvertToR(
     uint64_t *Xs,          // [n * 4]  Jacobian X
@@ -338,131 +336,21 @@ __global__ void ParallelConvertToR(
     uint64_t *rs,          // [n * 4]  output r values
     int       n)
 {
-    __shared__ uint64_t sh_prefixes[256 * 4]; 
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    int ltid = threadIdx.x;
+    if (tid >= n) return;
 
-    uint64_t z[4] = {1, 0, 0, 0};
-    bool valid = tid < n;
-
-    if (valid) {
-        z[0] = Zs[tid * 5 + 0];
-        z[1] = Zs[tid * 5 + 1];
-        z[2] = Zs[tid * 5 + 2];
-        z[3] = Zs[tid * 5 + 3];
-        // 處理 Z=0 的情況 (無窮遠點)
-        if (z[0] == 0 && z[1] == 0 && z[2] == 0 && z[3] == 0) {
-            z[0] = 1; // 暫時設為 1 以免 Batch Inverse 出錯，最後再改回 r=0
-        }
-    }
-
-    // Step 1: 前綴乘積
-    sh_prefixes[ltid * 4 + 0] = z[0];
-    sh_prefixes[ltid * 4 + 1] = z[1];
-    sh_prefixes[ltid * 4 + 2] = z[2];
-    sh_prefixes[ltid * 4 + 3] = z[3];
-
-    for (int stride = 1; stride < blockDim.x; stride *= 2) {
-        __syncthreads();
-        uint64_t tmp[4];
-        if (ltid >= stride) {
-            uint64_t a[4], b[4];
-            a[0] = sh_prefixes[ltid * 4 + 0]; a[1] = sh_prefixes[ltid * 4 + 1];
-            a[2] = sh_prefixes[ltid * 4 + 2]; a[3] = sh_prefixes[ltid * 4 + 3];
-            b[0] = sh_prefixes[(ltid - stride) * 4 + 0]; b[1] = sh_prefixes[(ltid - stride) * 4 + 1];
-            b[2] = sh_prefixes[(ltid - stride) * 4 + 2]; b[3] = sh_prefixes[(ltid - stride) * 4 + 3];
-            ModMulP(tmp, a, b);
-        }
-        __syncthreads();
-        if (ltid >= stride) {
-            sh_prefixes[ltid * 4 + 0] = tmp[0]; sh_prefixes[ltid * 4 + 1] = tmp[1];
-            sh_prefixes[ltid * 4 + 2] = tmp[2]; sh_prefixes[ltid * 4 + 3] = tmp[3];
-        }
-    }
-
-    // Step 2: 單個 ModInv
-    __shared__ uint64_t sh_inv_all[5];
-    if (ltid == blockDim.x - 1) {
-        sh_inv_all[0] = sh_prefixes[ltid * 4 + 0];
-        sh_inv_all[1] = sh_prefixes[ltid * 4 + 1];
-        sh_inv_all[2] = sh_prefixes[ltid * 4 + 2];
-        sh_inv_all[3] = sh_prefixes[ltid * 4 + 3];
-        sh_inv_all[4] = 0;
-        _ModInv(sh_inv_all);
-    }
-    __syncthreads();
-
-    if (!valid) return;
-
-    // Step 3: 計算個別 invZ
-    if (ltid == 0) {
-        // 第一個線程的 invZ 就已經是 inv_Pn * S_1 (因為 P_0 = z_0) ? No.
-    } 
-    
-    // ... (rest of the logic remains same, just removing the unused block above)
-    
-    // 考慮到 BlockDim 只有 256，最有效率的是「後向前綴乘積」
-    __shared__ uint64_t sh_suffixes[256 * 4];
-    sh_suffixes[ltid * 4 + 0] = z[0];
-    sh_suffixes[ltid * 4 + 1] = z[1];
-    sh_suffixes[ltid * 4 + 2] = z[2];
-    sh_suffixes[ltid * 4 + 3] = z[3];
-
-    for (int stride = 1; stride < blockDim.x; stride *= 2) {
-        __syncthreads();
-        uint64_t tmp[4];
-        if (ltid + stride < blockDim.x) {
-            uint64_t a[4], b[4];
-            a[0] = sh_suffixes[ltid * 4 + 0]; a[1] = sh_suffixes[ltid * 4 + 1];
-            a[2] = sh_suffixes[ltid * 4 + 2]; a[3] = sh_suffixes[ltid * 4 + 3];
-            b[0] = sh_suffixes[(ltid + stride) * 4 + 0]; b[1] = sh_suffixes[(ltid + stride) * 4 + 1];
-            b[2] = sh_suffixes[(ltid + stride) * 4 + 2]; b[3] = sh_suffixes[(ltid + stride) * 4 + 3];
-            ModMulP(tmp, a, b);
-        }
-        __syncthreads();
-        if (ltid + stride < blockDim.x) {
-            sh_suffixes[ltid * 4 + 0] = tmp[0]; sh_suffixes[ltid * 4 + 1] = tmp[1];
-            sh_suffixes[ltid * 4 + 2] = tmp[2]; sh_suffixes[ltid * 4 + 3] = tmp[3];
-        }
-    }
-    __syncthreads();
-
-    // 現在：
-    // sh_prefixes[i] = z_0 * ... * z_i
-    // sh_suffixes[i] = z_i * ... * z_{n-1}
-    // inv_Zi = inv_Pn * (z_0 * ... * z_{i-1}) * (z_{i+1} * ... * z_{n-1})
-    
-    uint64_t final_inv[4];
-    uint64_t base_inv[4] = {sh_inv_all[0], sh_inv_all[1], sh_inv_all[2], sh_inv_all[3]};
-    
-    uint64_t part[4] = {1, 0, 0, 0};
-    if (ltid > 0) {
-        part[0] = sh_prefixes[(ltid - 1) * 4 + 0];
-        part[1] = sh_prefixes[(ltid - 1) * 4 + 1];
-        part[2] = sh_prefixes[(ltid - 1) * 4 + 2];
-        part[3] = sh_prefixes[(ltid - 1) * 4 + 3];
-    }
-    ModMulP(final_inv, base_inv, part);
-    
-    if (ltid < blockDim.x - 1) {
-        uint64_t suff[4];
-        suff[0] = sh_suffixes[(ltid + 1) * 4 + 0];
-        suff[1] = sh_suffixes[(ltid + 1) * 4 + 1];
-        suff[2] = sh_suffixes[(ltid + 1) * 4 + 2];
-        suff[3] = sh_suffixes[(ltid + 1) * 4 + 3];
-        ModMulP(final_inv, final_inv, suff);
-    }
-    
-    // final_inv 現在就是 z_i^{-1} mod P
-    
-    // 檢查原本是否為無窮遠點
+    // Jacobian Z=0 means point-at-infinity; keep r=0.
     if (Zs[tid*5+0]==0 && Zs[tid*5+1]==0 && Zs[tid*5+2]==0 && Zs[tid*5+3]==0) {
         rs[tid*4+0] = rs[tid*4+1] = rs[tid*4+2] = rs[tid*4+3] = 0;
         return;
     }
 
+    uint64_t invZ5[5] = {
+        Zs[tid*5+0], Zs[tid*5+1], Zs[tid*5+2], Zs[tid*5+3], 0
+    };
+    _ModInv(invZ5);
+
     uint64_t invZ2[5];
-    uint64_t invZ5[5] = {final_inv[0], final_inv[1], final_inv[2], final_inv[3], 0};
     _ModMult(invZ2, invZ5, invZ5);
     invZ2[4] = 0;
 
@@ -566,51 +454,77 @@ static std::string hex256(const uint64_t v[4]) {
     return std::string(buf);
 }
 
-// 40-bit tag: lo = lower 32 bits (bits 0-31), hi = upper 8 bits (bits 32-39)
-struct Tag72 {
-    uint32_t lo;
-    uint16_t hi;
-    bool operator<(const Tag72 &o) const {
-        if (hi != o.hi) return hi < o.hi;
-        return lo < o.lo;
-    }
-    bool operator==(const Tag72 &o) const {
-        return lo == o.lo && hi == o.hi;
-    }
-} __attribute__((packed));
+static uint64_t read_le_u64_n(const uint8_t *p, int nbytes) {
+    uint64_t v = 0;
+    for (int i = 0; i < nbytes; i++) v |= ((uint64_t)p[i]) << (8 * i);
+    return v;
+}
 
-// 解析字串最後 12 個 hex 字元為 Tag72 (48 bits)
-// hi = 前 4 hex (16 bits), lo = 後 8 hex (32 bits)
-static bool parse_last12hex(Tag72 *out, const char *s, uint32_t len) {
-    if (!out || !s || len < 12) return false;
-    const char *p = s + len - 12;
-    uint16_t hi = 0;
-    uint32_t lo = 0;
-    for (int i = 0; i < 4; i++) {
-        char c = p[i];
-        uint8_t nibble = 0;
-        if (c >= '0' && c <= '9') nibble = (uint8_t)(c - '0');
-        else if (c >= 'a' && c <= 'f') nibble = (uint8_t)(c - 'a' + 10);
-        else if (c >= 'A' && c <= 'F') nibble = (uint8_t)(c - 'A' + 10);
-        else return false;
-        hi = (uint16_t)((hi << 4) | nibble);
+static void write_le_u64_n(uint8_t *p, int nbytes, uint64_t v) {
+    for (int i = 0; i < nbytes; i++) p[i] = (uint8_t)((v >> (8 * i)) & 0xFFULL);
+}
+
+static bool parse_cache_bits(const char magic[8], int *bits_out) {
+    if (!magic || !bits_out) return false;
+    if (!(magic[0] == 'B' && magic[1] == 'T' && magic[2] == 'C' && magic[3] == 'T' && magic[4] == 'A')) {
+        return false;
     }
-    for (int i = 4; i < 12; i++) {
-        char c = p[i];
-        uint32_t nibble = 0;
-        if (c >= '0' && c <= '9') nibble = (uint32_t)(c - '0');
-        else if (c >= 'a' && c <= 'f') nibble = (uint32_t)(c - 'a' + 10);
-        else if (c >= 'A' && c <= 'F') nibble = (uint32_t)(c - 'A' + 10);
-        else return false;
-        lo = (lo << 4) | nibble;
+    if (magic[5] < '0' || magic[5] > '9' || magic[6] < '0' || magic[6] > '9' || magic[7] < '0' || magic[7] > '9') {
+        return false;
     }
-    out->lo = lo;
-    out->hi = hi;
+    int bits = (magic[5] - '0') * 100 + (magic[6] - '0') * 10 + (magic[7] - '0');
+    if (!(bits == 48 || bits == 56 || bits == 64)) return false;
+    *bits_out = bits;
     return true;
+}
+
+static bool parse_last_hex_u64(uint64_t *out, const char *s, uint32_t len, int hex_len) {
+    if (!out || !s || hex_len <= 0 || len < (uint32_t)hex_len) return false;
+    const char *p = s + len - hex_len;
+    uint64_t v = 0;
+    for (int i = 0; i < hex_len; i++) {
+        char c = p[i];
+        uint64_t nibble = 0;
+        if (c >= '0' && c <= '9') nibble = (uint64_t)(c - '0');
+        else if (c >= 'a' && c <= 'f') nibble = (uint64_t)(c - 'a' + 10);
+        else if (c >= 'A' && c <= 'F') nibble = (uint64_t)(c - 'A' + 10);
+        else return false;
+        v = (v << 4) | nibble;
+    }
+    *out = v;
+    return true;
+}
+
+static inline void extract_tail_le_bytes_from_r(uint8_t *dst, int hex_len, const uint64_t *r_limbs) {
+    int nbytes = (hex_len + 1) / 2;
+    uint64_t lo = r_limbs[0];
+    uint64_t hi = r_limbs[1];
+
+    for (int i = 0; i < nbytes; i++) {
+        if (i < 8) dst[i] = (uint8_t)((lo >> (8 * i)) & 0xFFULL);
+        else dst[i] = (uint8_t)((hi >> (8 * (i - 8))) & 0xFFULL);
+    }
+    if (hex_len & 1) {
+        dst[nbytes - 1] &= 0x0F;
+    }
 }
 
 class MongoKeyCache {
 public:
+    MongoKeyCache() {
+        setTagBits(48);
+    }
+
+    bool configureHexLen(int hex_len) {
+        if (!(hex_len == 12 || hex_len == 14 || hex_len == 16)) return false;
+        setTagBits(hex_len * 4);
+        return true;
+    }
+
+    int tagHexLen() const { return tag_hex_len; }
+    int tagBits() const { return tag_bits; }
+    uint64_t tagMask() const { return tag_mask; }
+
     bool loadFromFile(const char *file_path) {
         if (!file_path || file_path[0] == '\0') return false;
 
@@ -636,15 +550,16 @@ public:
             return false;
         }
 
-        const char expected_magic[8] = {'B','T','C','T','A','0','4','8'};
-        if (memcmp(magic, expected_magic, sizeof(magic)) != 0) {
+        int file_bits = 0;
+        if (!parse_cache_bits(magic, &file_bits)) {
             fprintf(stderr,
-                    "MongoKeyCache: unsupported cache magic in %s (got=%.8s expected=BTCTA040)\n",
+                "MongoKeyCache: unsupported cache magic in %s (got=%.8s expected=BTCTA048/056/064)\n",
                     file_path, magic);
             return false;
         }
+        setTagBits(file_bits);
 
-        const uint64_t expected_payload = count * (uint64_t)sizeof(Tag72);
+        const uint64_t expected_payload = count * (uint64_t)entry_bytes;
         const uint64_t expected_total = expected_payload + 16ULL;
         if (file_size >= 0 && (uint64_t)file_size != expected_total) {
             fprintf(stderr,
@@ -673,11 +588,15 @@ public:
         }
 
         if (count > 0) {
-            in.read(reinterpret_cast<char*>(values.data()), (std::streamsize)(count * sizeof(Tag72)));
+            std::vector<uint8_t> payload((size_t)expected_payload);
+            in.read(reinterpret_cast<char*>(payload.data()), (std::streamsize)payload.size());
             if (!in.good()) {
                 fprintf(stderr, "MongoKeyCache: failed while reading cache payload from: %s\n", file_path);
                 values.clear();
                 return false;
+            }
+            for (uint64_t i = 0; i < count; i++) {
+                values[(size_t)i] = read_le_u64_n(payload.data() + (size_t)i * (size_t)entry_bytes, entry_bytes) & tag_mask;
             }
         }
 
@@ -703,7 +622,7 @@ public:
             printf("Skip sorted-check for fast startup (set VERIFY_CACHE_SORTED=1 to force check).\n");
         }
 
-        printf("Loaded %zu btc tags (40-bit) from cache file: %s\n", values.size(), file_path);
+        printf("Loaded %zu btc tags (%d-bit) from cache file: %s\n", values.size(), tag_bits, file_path);
         return !values.empty();
     }
 
@@ -715,20 +634,28 @@ public:
             return false;
         }
 
-        const char magic[8] = {'B','T','C','T','A','0','4','0'};
+        char magic[8] = {'B','T','C','T','A','0','0','0'};
+        magic[5] = (char)('0' + (tag_bits / 100));
+        magic[6] = (char)('0' + ((tag_bits / 10) % 10));
+        magic[7] = (char)('0' + (tag_bits % 10));
         const uint64_t count = (uint64_t)values.size();
         out.write(magic, sizeof(magic));
         out.write(reinterpret_cast<const char*>(&count), sizeof(count));
-        out.write(reinterpret_cast<const char*>(values.data()), (std::streamsize)(count * sizeof(Tag72)));
+
+        std::vector<uint8_t> payload((size_t)count * (size_t)entry_bytes);
+        for (uint64_t i = 0; i < count; i++) {
+            write_le_u64_n(payload.data() + (size_t)i * (size_t)entry_bytes, entry_bytes, values[(size_t)i]);
+        }
+        out.write(reinterpret_cast<const char*>(payload.data()), (std::streamsize)payload.size());
         if (!out.good()) {
             return false;
         }
 
-        printf("Saved %zu btc tags (40-bit) to cache file: %s\n", values.size(), file_path);
+        printf("Saved %zu btc tags (%d-bit) to cache file: %s\n", values.size(), tag_bits, file_path);
         return true;
     }
 
-    bool loadFromMongo(const char *mongo_uri, const char *db_name, const char *collection_name) {
+    bool loadFromMongo(const char *mongo_uri, const char *db_name, const char *collection_name, const char *field_name) {
         mongoc_client_t *client = mongoc_client_new(mongo_uri);
         if (!client) {
             fprintf(stderr, "MongoKeyCache: failed to parse MongoDB URI\n");
@@ -744,22 +671,23 @@ public:
         const bson_t *doc = nullptr;
 
         values.clear();
-        printf("Loading btc r tags (last 10 hex chars) from MongoDB into local cache...\n");
+        if (!field_name || field_name[0] == '\0') field_name = "r";
+        printf("Loading btc r tags (last %d hex chars) from MongoDB into local cache...\n", tag_hex_len);
         uint64_t load_count = 0;
         while (mongoc_cursor_next(cursor, &doc)) {
             bson_iter_t it;
             const char *id_str = nullptr;
             uint32_t id_len = 0;
 
-            if (bson_iter_init_find(&it, doc, "r") && BSON_ITER_HOLDS_UTF8(&it)) {
+            if (bson_iter_init_find(&it, doc, field_name) && BSON_ITER_HOLDS_UTF8(&it)) {
                 id_str = bson_iter_utf8(&it, &id_len);
             }
 
-            if (!id_str || id_len < 12) continue;
+            if (!id_str || id_len < (uint32_t)tag_hex_len) continue;
 
-            Tag72 tag;
-            if (parse_last12hex(&tag, id_str, id_len)) {
-                values.push_back(tag);
+            uint64_t tag = 0;
+            if (parse_last_hex_u64(&tag, id_str, id_len, tag_hex_len)) {
+                values.push_back(tag & tag_mask);
                 load_count++;
                 if (load_count % 1000000 == 0) {
                     printf("\r  Loaded %llu M entries...", (unsigned long long)(load_count / 1000000));
@@ -781,15 +709,15 @@ public:
 
         std::sort(values.begin(), values.end());
         values.erase(std::unique(values.begin(), values.end()), values.end());
-        printf("\rLoaded %zu btc tags (40-bit) into local cache\n", values.size());
+        printf("\rLoaded %zu btc tags (%d-bit) into local cache\n", values.size(), tag_bits);
         return !values.empty();
     }
 
-    bool contains(const Tag72 &value) const {
+    bool contains(uint64_t value) const {
         return std::binary_search(values.begin(), values.end(), value);
     }
 
-    size_t containsBatch(const Tag72 *tags, uint8_t *hits, size_t n) const {
+    size_t containsBatch(const uint64_t *tags, uint8_t *hits, size_t n) const {
         if (!tags || !hits || n == 0 || values.empty()) return 0;
 
         size_t matched = 0;
@@ -805,7 +733,18 @@ public:
     }
 
 private:
-    std::vector<Tag72> values;
+    void setTagBits(int bits) {
+        tag_bits = bits;
+        tag_hex_len = bits / 4;
+        entry_bytes = bits / 8;
+        tag_mask = (bits == 64) ? 0xFFFFFFFFFFFFFFFFULL : ((1ULL << bits) - 1ULL);
+    }
+
+    int tag_bits = 48;
+    int tag_hex_len = 12;
+    int entry_bytes = 6;
+    uint64_t tag_mask = ((1ULL << 48) - 1ULL);
+    std::vector<uint64_t> values;
 };
 
 // ===========================================================================
@@ -831,22 +770,40 @@ private:
     std::queue<T> q;
     std::mutex m;
     std::condition_variable cv;
+    size_t max_size = 0; // 0 means unbounded
 public:
+    SafeQueue() = default;
+    explicit SafeQueue(size_t cap) : max_size(cap) {}
+
     void push(T val) {
-        std::lock_guard<std::mutex> lock(m);
+        std::unique_lock<std::mutex> lock(m);
+        if (max_size > 0) {
+            cv.wait(lock, [this]{ return q.size() < max_size; });
+        }
         q.push(std::move(val));
-        cv.notify_one();
+        cv.notify_all();
     }
+
     T pop() {
         std::unique_lock<std::mutex> lock(m);
         cv.wait(lock, [this]{ return !q.empty(); });
         T val = std::move(q.front());
         q.pop();
+        cv.notify_all();
         return val;
     }
+
     size_t size() {
         std::lock_guard<std::mutex> lock(m);
         return q.size();
+    }
+
+    void setCapacity(size_t cap) {
+        {
+            std::lock_guard<std::mutex> lock(m);
+            max_size = cap;
+        }
+        cv.notify_all();
     }
 };
 
@@ -857,20 +814,25 @@ struct MatchData {
 };
 
 SafeQueue<MatchData> g_match_queue;
+std::atomic<long long> g_scan_candidates(0);
+std::atomic<long long> g_match_enqueued(0);
+std::atomic<long long> g_match_processed(0);
+std::atomic<long long> g_match_precise(0);
+std::atomic<long long> g_mongo_total_us(0);
 
-void MongoMatchLogger(const char* mongo_uri) {
+void MongoMatchLogger(const char* mongo_uri, const char* mongo_db, const char* candidate_collection) {
     mongoc_client_t *client = mongoc_client_new(mongo_uri);
     if (!client) {
         fprintf(stderr, "MatchLogger: Failed to parse MongoDB URI\n");
         return;
     }
-    mongoc_collection_t *match_col = mongoc_client_get_collection(client, "ecdsa", "match");
-    mongoc_collection_t *btc_col = mongoc_client_get_collection(client, "ecdsa", "btc");
-    mongoc_collection_t *candidate_col = mongoc_client_get_collection(client, "ecdsa", "matched_candidates");
+    mongoc_collection_t *candidate_col = mongoc_client_get_collection(client, mongo_db, candidate_collection);
 
     while (true) {
         MatchData data = g_match_queue.pop();
         if (data.exit_signal) break;
+
+        auto t0 = std::chrono::high_resolution_clock::now();
 
         std::string ks = data.k;
         std::string rs = data.r;
@@ -900,69 +862,13 @@ void MongoMatchLogger(const char* mongo_uri) {
         bson_destroy(&update);
         bson_destroy(&filter);
 
-        // 2. Query MongoDB btc collection
-        std::string r0 = "0" + rs;
-        std::string r00 = "00" + rs;
-
-        // Query using $in: { "r": { "$in": [rs, r0, r00] } }
-        bson_t *query = bson_new();
-        bson_t in_child;
-        BSON_APPEND_DOCUMENT_BEGIN(query, "r", &in_child);
-        bson_t in_array;
-        BSON_APPEND_ARRAY_BEGIN(&in_child, "$in", &in_array);
-        BSON_APPEND_UTF8(&in_array, "0", rs.c_str());
-        BSON_APPEND_UTF8(&in_array, "1", r0.c_str());
-        BSON_APPEND_UTF8(&in_array, "2", r00.c_str());
-        bson_append_array_end(&in_child, &in_array);
-        bson_append_document_end(query, &in_child);
-
-        mongoc_cursor_t *cursor = mongoc_collection_find_with_opts(btc_col, query, NULL, NULL);
-        const bson_t *found_btc_doc;
-        bool is_precise_match = mongoc_cursor_next(cursor, &found_btc_doc);
-        
-        if (is_precise_match) {
-            bson_t c_filter;
-            bson_t c_update;
-            bson_init(&c_filter);
-            BSON_APPEND_UTF8(&c_filter, "r", rs.c_str());
-            BSON_APPEND_UTF8(&c_filter, "k", ks.c_str());
-            bson_init(&c_update);
-            bson_t c_set_doc;
-            BSON_APPEND_DOCUMENT_BEGIN(&c_update, "$set", &c_set_doc);
-            BSON_APPEND_UTF8(&c_set_doc, "status", "precise");
-            BSON_APPEND_BOOL(&c_set_doc, "found", true);
-            BSON_APPEND_TIME_T(&c_set_doc, "updated_at", time(NULL));
-            bson_append_document_end(&c_update, &c_set_doc);
-            if (!mongoc_collection_update_one(candidate_col, &c_filter, &c_update, nullptr, nullptr, &error)) {
-                fprintf(stderr, "MongoDB Candidate Finalize Error: %s\n", error.message);
-            }
-            bson_destroy(&c_update);
-            bson_destroy(&c_filter);
-
-            // Precise match found! Write to MongoDB match collection.
-            bson_t *doc = bson_new();
-            BSON_APPEND_UTF8(doc, "r", rs.c_str());
-            BSON_APPEND_UTF8(doc, "k", ks.c_str());
-            BSON_APPEND_UTF8(doc, "found", "y");
-            BSON_APPEND_TIME_T(doc, "time", time(NULL));
-            
-            if (!mongoc_collection_insert_one(match_col, doc, NULL, NULL, &error)) {
-                fprintf(stderr, "MongoDB Insert Error: %s\n", error.message);
-            }
-            bson_destroy(doc);
-            
-            printf("               [PRECISE MATCH FOUND IN BG!] Inserted into match col for r=%s\n", rs.c_str());
-        } else {
-            // Not a precise match. Keep the candidate record for manual inspection.
-        }
-        
-        mongoc_cursor_destroy(cursor);
-        bson_destroy(query);
+        auto t1 = std::chrono::high_resolution_clock::now();
+        long long us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+        g_mongo_total_us.fetch_add(us, std::memory_order_relaxed);
+        g_match_processed.fetch_add(1, std::memory_order_relaxed);
     }
 
     mongoc_collection_destroy(candidate_col);
-    mongoc_collection_destroy(match_col);
-    mongoc_collection_destroy(btc_col);
     mongoc_client_destroy(client);
 }
 
@@ -972,32 +878,66 @@ void MongoMatchLogger(const char* mongo_uri) {
 class HybridScanner {
 public:
     const MongoKeyCache *local_cache = nullptr;
-    std::vector<Tag72> local_tags;
+    const BlockedBloomFilter *bloom_filter = nullptr;
+    int tag_hex_len = 12;
+    std::vector<uint64_t> local_tags;
     std::vector<uint8_t> local_hits;
+    std::vector<uint8_t> bloom_tags;
+    bool debug_first_r = false;
+    bool debug_printed = false;
 
-    HybridScanner(const MongoKeyCache *cache) {
+    HybridScanner(const MongoKeyCache *cache, const BlockedBloomFilter *bloom, int hex_len) {
         local_cache = cache;
+        bloom_filter = bloom;
+        tag_hex_len = hex_len;
+        const char *dbg = getenv("DEBUG_FIRST_R");
+        debug_first_r = (dbg && dbg[0] != '\0' && atoi(dbg) != 0);
     }
 
     ~HybridScanner() {}
 
     void checkMatchBatch(const uint64_t k_start[4], const uint64_t *rs_ptr, int n) {
-        if (n <= 0 || !local_cache || local_cache->empty()) return;
+        if (n <= 0) return;
 
-        if ((int)local_tags.size() < n) local_tags.resize((size_t)n);
-        if ((int)local_hits.size() < n) local_hits.resize((size_t)n);
+        const bool use_bloom = (bloom_filter != nullptr);
+        if (!use_bloom && (!local_cache || local_cache->empty())) return;
 
-        for (int i = 0; i < n; i++) {
-            // 最後 12 hex chars = 最低 48 bits
-            // 前 4 hex (最高 16 bits) = rs 數值 bits 32-47
-            // 後 8 hex (最低 32 bits) = rs 數值 bits 0-31
-            local_tags[(size_t)i].lo = (uint32_t)(rs_ptr[i * 4] & 0xFFFFFFFFULL);         // bits 0-31
-            local_tags[(size_t)i].hi = (uint16_t)((rs_ptr[i * 4] >> 32) & 0xFFFFULL);     // bits 32-47
+        const size_t tag_bytes = (size_t)((tag_hex_len + 1) / 2);
+
+        if (use_bloom) {
+            if ((int)local_hits.size() < n) local_hits.resize((size_t)n);
+            if (bloom_tags.size() < (size_t)n * tag_bytes) bloom_tags.resize((size_t)n * tag_bytes);
+
+            for (int i = 0; i < n; i++) {
+                uint8_t *dst = bloom_tags.data() + (size_t)i * tag_bytes;
+                extract_tail_le_bytes_from_r(dst, tag_hex_len, rs_ptr + i * 4);
+                local_hits[(size_t)i] = bloom_filter->possiblyContains(dst, tag_bytes) ? 1 : 0;
+            }
+        } else {
+            if ((int)local_tags.size() < n) local_tags.resize((size_t)n);
+            if ((int)local_hits.size() < n) local_hits.resize((size_t)n);
+
+            uint64_t mask = local_cache->tagMask();
+
+            for (int i = 0; i < n; i++) {
+                local_tags[(size_t)i] = rs_ptr[i * 4] & mask;
+            }
+            local_cache->containsBatch(local_tags.data(), local_hits.data(), (size_t)n);
+
+            if (debug_first_r && !debug_printed && n > 0) {
+                debug_printed = true;
+                printf("\n[DEBUG_FIRST_R] r0=%s tail_tag=0x%016llx hit=%d\n",
+                       hex256(rs_ptr).c_str(),
+                       (unsigned long long)local_tags[0],
+                       (int)local_hits[0]);
+                fflush(stdout);
+            }
         }
-        local_cache->containsBatch(local_tags.data(), local_hits.data(), (size_t)n);
 
         for (int i = 0; i < n; i++) {
             if (!local_hits[(size_t)i]) continue;
+
+            g_scan_candidates.fetch_add(1, std::memory_order_relaxed);
 
             uint64_t k_match[4];
             uint64_t carry = (uint64_t)i;
@@ -1010,6 +950,7 @@ public:
             mdata.k = hex256(k_match);
             mdata.r = hex256(rs_ptr + i * 4);
             g_match_queue.push(std::move(mdata));
+            g_match_enqueued.fetch_add(1, std::memory_order_relaxed);
         }
     }
 };
@@ -1079,21 +1020,75 @@ int main(int argc, char **argv) {
     mongoc_init();
 
     MongoKeyCache mongo_key_cache;
+    int scanner_hex_len = 12;
+    const char *cache_hex_env = getenv("CACHE_HEX_LEN");
+    if (cache_hex_env && cache_hex_env[0] != '\0') {
+        int hex_len = atoi(cache_hex_env);
+        if (hex_len < 12 || hex_len > 20) {
+            fprintf(stderr, "Invalid CACHE_HEX_LEN=%s (supported: 12..20)\n", cache_hex_env);
+            return 1;
+        }
+        scanner_hex_len = hex_len;
+        if (hex_len <= 16 && !mongo_key_cache.configureHexLen(hex_len)) {
+            fprintf(stderr, "Invalid CACHE_HEX_LEN=%s for exact cache mode\n", cache_hex_env);
+            return 1;
+        }
+    }
+
+    BlockedBloomFilter bloom_filter;
+    BlockedBloomFilter *bloom_ptr = nullptr;
+    const char *bloom_file_env = getenv("MONGO_BLOOM_FILE");
+    if (bloom_file_env && bloom_file_env[0] != '\0') {
+        if (!bloom_filter.load(bloom_file_env)) {
+            fprintf(stderr, "Failed to load bloom file: %s\n", bloom_file_env);
+            return 1;
+        }
+        if ((int)bloom_filter.hexLen() != scanner_hex_len) {
+            fprintf(stderr, "Bloom hex-len mismatch: bloom=%u CACHE_HEX_LEN=%d\n", bloom_filter.hexLen(), scanner_hex_len);
+            return 1;
+        }
+        bloom_ptr = &bloom_filter;
+        printf("MONGO_BLOOM_FILE=%s (k=%u blocks=%llu)\n",
+               bloom_file_env,
+               bloom_filter.kHashes(),
+               (unsigned long long)bloom_filter.numBlocks());
+    }
+
     const char *cache_file_env = getenv("MONGO_KEYS_CACHE_FILE");
     const char *cache_file = (cache_file_env && cache_file_env[0]) ? cache_file_env : "mongo_keys.cache.bin";
     printf("MONGO_KEYS_CACHE_FILE=%s\n", cache_file);
+    printf("CACHE_HEX_LEN=%d\n", scanner_hex_len);
     fflush(stdout);
 
-    bool local_cache_ready = mongo_key_cache.loadFromFile(cache_file);
-    if (!local_cache_ready) {
-        printf("Local cache load failed; fallback to MongoDB scan...\n");
-        fflush(stdout);
-        local_cache_ready = mongo_key_cache.loadFromMongo("mongodb://127.0.0.1:27017", "ecdsa", "btc");
-        if (local_cache_ready) {
-            if (!mongo_key_cache.saveToFile(cache_file)) {
-                fprintf(stderr, "Warning: failed to save local cache file: %s\n", cache_file);
+    bool local_cache_ready = false;
+    if (!bloom_ptr) {
+        local_cache_ready = mongo_key_cache.loadFromFile(cache_file);
+        if (!local_cache_ready) {
+            if (scanner_hex_len > 16) {
+                fprintf(stderr, "Exact cache fallback only supports up to 16 hex; set MONGO_BLOOM_FILE for >16.\n");
+                return 1;
+            }
+
+            printf("Local cache load failed; fallback to MongoDB scan...\n");
+            fflush(stdout);
+            const char *mongo_uri = getenv("MONGO_URI");
+            const char *mongo_db = getenv("MONGO_DB");
+            const char *mongo_collection = getenv("MONGO_COLLECTION");
+            const char *mongo_field = getenv("MONGO_FIELD");
+            if (!mongo_uri || mongo_uri[0] == '\0') mongo_uri = "mongodb://127.0.0.1:27017";
+            if (!mongo_db || mongo_db[0] == '\0') mongo_db = "ecdsa";
+            if (!mongo_collection || mongo_collection[0] == '\0') mongo_collection = "btc";
+            if (!mongo_field || mongo_field[0] == '\0') mongo_field = "r";
+
+            local_cache_ready = mongo_key_cache.loadFromMongo(mongo_uri, mongo_db, mongo_collection, mongo_field);
+            if (local_cache_ready) {
+                if (!mongo_key_cache.saveToFile(cache_file)) {
+                    fprintf(stderr, "Warning: failed to save local cache file: %s\n", cache_file);
+                }
             }
         }
+    } else {
+        local_cache_ready = true;
     }
 
     if (!local_cache_ready) {
@@ -1109,14 +1104,52 @@ int main(int argc, char **argv) {
     // -----------------------------------------------------------------------
     // 分配 Ring Buffer 與 CUDA Streams
     // -----------------------------------------------------------------------
-    const int num_streams = 32;
-    cudaStream_t streams[num_streams];
-    cudaEvent_t copy_done_events[num_streams];
-    uint64_t *d_X[num_streams], *d_Y[num_streams], *d_Z[num_streams], *d_r[num_streams];
-    uint64_t *h_r[num_streams];
+    static const int kMaxStreams = 32;
+    int num_streams = kMaxStreams;
+    const char *streams_env = getenv("NUM_STREAMS");
+    if (streams_env && streams_env[0] != '\0') {
+        int requested = atoi(streams_env);
+        if (requested > 0 && requested <= kMaxStreams) num_streams = requested;
+    }
+
+    cudaStream_t streams[kMaxStreams];
+    cudaEvent_t copy_done_events[kMaxStreams];
+    uint64_t *d_X[kMaxStreams], *d_Y[kMaxStreams], *d_Z[kMaxStreams], *d_r[kMaxStreams];
+    uint64_t *h_r[kMaxStreams];
+    for (int i = 0; i < kMaxStreams; i++) {
+        streams[i] = nullptr;
+        copy_done_events[i] = nullptr;
+        d_X[i] = d_Y[i] = d_Z[i] = d_r[i] = nullptr;
+        h_r[i] = nullptr;
+    }
 
     size_t X_bytes = (size_t)n * 4 * sizeof(uint64_t);
     size_t Z_bytes = (size_t)n * 5 * sizeof(uint64_t);
+
+    size_t free_mem = 0, total_mem = 0;
+    checkCuda(cudaMemGetInfo(&free_mem, &total_mem), "cudaMemGetInfo");
+    const size_t bytes_per_stream = X_bytes * 3 + Z_bytes; // d_X + d_Y + d_r + d_Z
+    size_t usable_mem = (size_t)((double)free_mem * 0.80); // leave headroom for kernels/runtime
+    int max_streams_by_mem = (bytes_per_stream > 0) ? (int)(usable_mem / bytes_per_stream) : 1;
+    if (max_streams_by_mem < 1) {
+        fprintf(stderr,
+                "Not enough free GPU memory for even 1 stream: need %.2f GiB, free %.2f GiB (usable %.2f GiB). Reduce batch size.\n",
+                (double)bytes_per_stream / (1024.0 * 1024.0 * 1024.0),
+                (double)free_mem / (1024.0 * 1024.0 * 1024.0),
+                (double)usable_mem / (1024.0 * 1024.0 * 1024.0));
+        return 1;
+    }
+    if (num_streams > max_streams_by_mem) num_streams = max_streams_by_mem;
+    if (num_streams > kMaxStreams) num_streams = kMaxStreams;
+    if (num_streams < 1) num_streams = 1;
+
+    printf("GPU mem free/total: %.2f / %.2f GiB\n",
+           (double)free_mem / (1024.0 * 1024.0 * 1024.0),
+           (double)total_mem / (1024.0 * 1024.0 * 1024.0));
+    printf("Per-stream device buffer: %.2f GiB, using streams=%d (NUM_STREAMS requested=%s)\n",
+           (double)bytes_per_stream / (1024.0 * 1024.0 * 1024.0),
+           num_streams,
+           (streams_env && streams_env[0] != '\0') ? streams_env : "auto");
 
     for (int i = 0; i < num_streams; i++) {
         checkCuda(cudaStreamCreate(&streams[i]), "stream create");
@@ -1143,8 +1176,7 @@ int main(int argc, char **argv) {
         int requested = atoi(workers_env);
         if (requested > 0) num_workers = requested;
     }
-    SafeQueue<PendingBatch> completion_queue;
-    SafeQueue<ScanTask> scan_queue;
+    SafeQueue<PendingBatch> completion_queue((size_t)num_streams * 4);
     SafeQueue<int> free_indices;
     for (int i = 0; i < num_streams; i++) free_indices.push(i);
 
@@ -1160,7 +1192,27 @@ int main(int argc, char **argv) {
         if (requested >= 1) max_pending_scan = requested;
     }
 
-    std::thread mongo_logger(MongoMatchLogger, "mongodb://127.0.0.1:27017");
+    SafeQueue<ScanTask> scan_queue((size_t)max_pending_scan);
+
+    // Backpressure for Mongo match queue (candidate -> Mongo logger).
+    // 0 means unbounded.
+    size_t max_pending_match = 0;
+    const char *pending_match_env = getenv("MAX_PENDING_MATCH");
+    if (pending_match_env && pending_match_env[0] != '\0') {
+        long long requested = atoll(pending_match_env);
+        if (requested > 0) max_pending_match = (size_t)requested;
+    }
+    g_match_queue.setCapacity(max_pending_match);
+
+    const char *logger_mongo_uri = getenv("MONGO_URI");
+    const char *logger_mongo_db = getenv("MONGO_DB");
+    const char *logger_candidate_collection = getenv("MONGO_CANDIDATE_COLLECTION");
+    if (!logger_mongo_uri || logger_mongo_uri[0] == '\0') logger_mongo_uri = "mongodb://127.0.0.1:27017";
+    if (!logger_mongo_db || logger_mongo_db[0] == '\0') logger_mongo_db = "ecdsa";
+    if (!logger_candidate_collection || logger_candidate_collection[0] == '\0') logger_candidate_collection = "matched_candidates";
+
+    printf("Candidate logger target: %s / %s.%s\n", logger_mongo_uri, logger_mongo_db, logger_candidate_collection);
+    std::thread mongo_logger(MongoMatchLogger, logger_mongo_uri, logger_mongo_db, logger_candidate_collection);
 
     std::thread completion_worker([&completion_queue, &scan_queue, &free_indices, h_r, copy_done_events, X_bytes]() {
         while (true) {
@@ -1184,8 +1236,8 @@ int main(int argc, char **argv) {
 
     std::vector<std::thread> workers;
     for (int i = 0; i < num_workers; i++) {
-        workers.emplace_back([&scan_queue, &mongo_key_cache]() {
-            HybridScanner scanner(&mongo_key_cache);
+        workers.emplace_back([&scan_queue, &mongo_key_cache, bloom_ptr, scanner_hex_len]() {
+            HybridScanner scanner(&mongo_key_cache, bloom_ptr, scanner_hex_len);
             while (true) {
                 ScanTask task = scan_queue.pop();
                 if (task.exit_signal) break;
@@ -1200,6 +1252,11 @@ int main(int argc, char **argv) {
 
     printf("Starting Producer loop (GPU) with %d Workers...\n", num_workers);
     printf("PendingScan cap: %d batches\n", max_pending_scan);
+    if (max_pending_match > 0) {
+        printf("PendingMatch cap: %zu items\n", max_pending_match);
+    } else {
+        printf("PendingMatch cap: unbounded\n");
+    }
 
     std::atomic<long long> total_keys(0);
     auto start_time = std::chrono::high_resolution_clock::now();
@@ -1221,11 +1278,6 @@ int main(int argc, char **argv) {
     };
 
     do {
-        // Throttle producer when scan queue is too deep to keep memory bounded.
-        while ((int)scan_queue.size() >= max_pending_scan) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        }
-
         // 從空閒索引隊列取出一個 Buffer
         int idx = free_indices.pop();
 
@@ -1256,9 +1308,45 @@ int main(int argc, char **argv) {
         std::chrono::duration<double> print_elapsed = current_time - last_print;
 
         if (print_elapsed.count() > 2.0) {
+             static long long last_scanned_hits = 0;
+             static long long last_enqueued = 0;
+             static long long last_processed = 0;
+             static long long last_precise = 0;
+
+             const double interval_s = print_elapsed.count();
             double speed = total_keys / total_elapsed.count();
-             printf("\r[PRODUCER] Speed: %.2f keys/sec | Total: %lld | PendingCopy: %zu | PendingScan: %zu", 
-                 speed, (long long)total_keys, completion_queue.size(), scan_queue.size());
+            long long scanned_hits = g_scan_candidates.load(std::memory_order_relaxed);
+            long long enqueued = g_match_enqueued.load(std::memory_order_relaxed);
+            long long processed = g_match_processed.load(std::memory_order_relaxed);
+            long long precise = g_match_precise.load(std::memory_order_relaxed);
+            long long mongo_us = g_mongo_total_us.load(std::memory_order_relaxed);
+            double mongo_avg_ms = (processed > 0) ? ((double)mongo_us / (double)processed / 1000.0) : 0.0;
+
+             double cand_per_sec = (interval_s > 0.0) ? (double)(scanned_hits - last_scanned_hits) / interval_s : 0.0;
+             double enq_per_sec = (interval_s > 0.0) ? (double)(enqueued - last_enqueued) / interval_s : 0.0;
+             double proc_per_sec = (interval_s > 0.0) ? (double)(processed - last_processed) / interval_s : 0.0;
+             double prec_per_sec = (interval_s > 0.0) ? (double)(precise - last_precise) / interval_s : 0.0;
+
+             last_scanned_hits = scanned_hits;
+             last_enqueued = enqueued;
+             last_processed = processed;
+             last_precise = precise;
+
+                 printf("\r[PRODUCER] Speed: %.2f keys/sec | Total: %lld | PendingCopy: %zu | PendingScan: %zu | PendingMatch: %zu | Cand:%lld (%.1f/s) Enq:%lld (%.1f/s) Proc:%lld (%.1f/s) Prec:%lld (%.1f/s) MongoAvg:%.2fms",
+                   speed,
+                   (long long)total_keys,
+                   completion_queue.size(),
+                   scan_queue.size(),
+                     g_match_queue.size(),
+                   scanned_hits,
+                 cand_per_sec,
+                   enqueued,
+                 enq_per_sec,
+                   processed,
+                 proc_per_sec,
+                   precise,
+                 prec_per_sec,
+                   mongo_avg_ms);
             fflush(stdout);
             last_print = current_time;
         }
@@ -1288,17 +1376,25 @@ int main(int argc, char **argv) {
     g_match_queue.push(m_sentinel);
     mongo_logger.join();
 
+        printf("\n[FINAL] Cand=%lld Enq=%lld Proc=%lld Prec=%lld PendingMatch=%zu\n",
+            g_scan_candidates.load(std::memory_order_relaxed),
+            g_match_enqueued.load(std::memory_order_relaxed),
+            g_match_processed.load(std::memory_order_relaxed),
+            g_match_precise.load(std::memory_order_relaxed),
+            g_match_queue.size());
+        fflush(stdout);
+
     // Cleanup MongoDB Driver (Global)
     mongoc_cleanup();
 
     for (int i = 0; i < num_streams; i++) {
-        cudaFreeHost(h_r[i]);
-        cudaFree(d_X[i]);
-        cudaFree(d_Y[i]);
-        cudaFree(d_Z[i]);
-        cudaFree(d_r[i]);
-        cudaEventDestroy(copy_done_events[i]);
-        cudaStreamDestroy(streams[i]);
+        if (h_r[i]) cudaFreeHost(h_r[i]);
+        if (d_X[i]) cudaFree(d_X[i]);
+        if (d_Y[i]) cudaFree(d_Y[i]);
+        if (d_Z[i]) cudaFree(d_Z[i]);
+        if (d_r[i]) cudaFree(d_r[i]);
+        if (copy_done_events[i]) cudaEventDestroy(copy_done_events[i]);
+        if (streams[i]) cudaStreamDestroy(streams[i]);
     }
 
     return 0;
